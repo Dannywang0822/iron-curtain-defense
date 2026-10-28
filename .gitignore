@@ -1,0 +1,11 @@
+# WorkBuddy 项目数据（非源码，不入库）
+.workbuddy/
+
+# 系统杂物
+.DS_Store
+Thumbs.db
+
+# 依赖与临时产物
+node_modules/
+*.log
+*.tmp

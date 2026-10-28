@@ -1,0 +1,3320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>铁幕防线 / IRON VEIL</title>
+<style>
+  /* 色值一律由 JS 的 PALETTE 注入（见脚本 1. 调色板），CSS 内不写字面色量 */
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: var(--iv-black); overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #stage {
+    position: fixed; inset: 0; display: block;
+    background: var(--iv-black); cursor: default;
+  }
+  #stage.ptr { cursor: pointer; }
+  #boot {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--iv-text2); font: 14px system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--iv-bg); letter-spacing: 2px;
+  }
+  #boot.hide { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1280" height="720" aria-label="铁幕防线 游戏画面"></canvas>
+<div id="boot">IRON VEIL 载入中…</div>
+<script>
+/* ============================================================================
+   铁幕防线 / IRON VEIL  —— 单文件塔防
+   逻辑分辨率 1280x720；零外部资源；Canvas2D 手绘；WebAudio 振荡器合成音效
+   数值来源：design/gdd.md v1.0 ｜ 视觉来源：design/art-bible.md v1.0
+   ========================================================================== */
+(function () {
+'use strict';
+
+/* ---------------------------------------------------------------- 0. 常量 */
+var LW = 1280, LH = 720;                 // 逻辑分辨率
+var FIELD_X = 0, FIELD_Y = 64, FIELD_W = 1000, FIELD_H = 576;   // 战场
+var BOTTOM_Y = 640, BOTTOM_H = 80;       // 底部波次控制
+var PANEL_X = 1000, PANEL_Y = 64, PANEL_W = 280, PANEL_H = 656; // 右侧建造栏
+var CELL = 40, GRID_OX = 0, GRID_OY = 72, GRID_COLS = 25, GRID_ROWS = 14;
+var PATH_W = 26;                         // 路面宽度
+var SAVE_KEY = 'ironveil_save_v1';
+var VERSION = 1;
+var FONT = 'system-ui,-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif';
+var MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,"Roboto Mono",monospace';
+var GAP_MS = 20000;                      // 波间倒计时 20s（三图一致）；奖励 = 剩余整秒 × 2 = 40 = 上限
+var TAU = Math.PI * 2;
+var BOSS_TG_MS = 400;                    // Boss 召唤视觉预告（不禁足、不影响结算）
+
+/* ------------------------------------------------------- 1. 调色板 —— 唯一取色入口
+   硬约束（art-bible §6.2 A3）：本项目除本表外不得出现任何十六进制色值字面量；
+   换色板 = 换数据，不碰渲染逻辑。色盲两套表只替换强调/危险/合法/警告四色，几何不动。 */
+var PALETTE = {
+  base: {
+    bg: '#0A0F16', ground: '#131C26', path: '#1F2B38', grid: '#2A3A4C',
+    accent: '#35E0FF', danger: '#FF3B47', warn: '#FFC53D', text: '#E6F0F7',
+    text2: '#8FA3B5', ok: '#7DFFB2', locked: '#5C6B7C',
+    panel: '#16202C', topbar: '#0F1720', edge: '#E6F0F7'
+  },
+  aux: {
+    white: '#FFFFFF', black: '#000000', warnSoft: '#FFE08A', iceLight: '#9FC4FF',
+    pathEdge: '#0E151D', pathBase: '#243244', pathTop: '#26374A', pathLine: '#3A5068',
+    wardenAura: '#F2D7C2', bossStage2: '#FF7A3B'
+  },
+  tower: { A: '#FF9E42', B: '#B47BFF', C: '#5B8CFF', D: '#FF5FA2' },
+  enemy: {
+    GRUNT: '#8C9BA8', SPRINTER: '#6EE7A8', BULWARK: '#6F849C',
+    WASP: '#A78BFA', WARDEN: '#CE6850', BOSS: '#F2F6FA'
+  },
+  /* A3 色盲三档：off 即 base；两套替换表见下 */
+  deuteranopia: { accent: '#35E0FF', danger: '#FF9E42', ok: '#5B8CFF', warn: '#FFE08A' },
+  tritanopia:   { accent: '#FFFFFF', danger: '#FF5FA2', ok: '#FFC53D', warn: '#FF9E42' }
+};
+/* C = base + aux 的扁平视图（渲染层只读 C.xxx，绝不写字面色量） */
+var C = (function () {
+  var o = {}, k;
+  for (k in PALETTE.base) if (PALETTE.base.hasOwnProperty(k)) o[k] = PALETTE.base[k];
+  for (k in PALETTE.aux) if (PALETTE.aux.hasOwnProperty(k)) o[k] = PALETTE.aux[k];
+  return o;
+})();
+var THEMES = {
+  off: { accent: C.accent, danger: C.danger, ok: C.ok, warn: C.warn },
+  deuter: PALETTE.deuteranopia,
+  trit: PALETTE.tritanopia
+};
+/* 运行时主题：TH.xxx 读到的是已映射值 */
+var TH = { accent: C.accent, danger: C.danger, ok: C.ok, warn: C.warn };
+function applyTheme(mode) {
+  var t = THEMES[mode] || THEMES.off;
+  TH.accent = t.accent; TH.danger = t.danger; TH.ok = t.ok; TH.warn = t.warn;
+}
+/* CSS 核心色由本表注入（CSS 内零字面色量）；无 DOM 能力时静默跳过（便于无头测试） */
+(function injectCssColors() {
+  try {
+    var el = document.documentElement;
+    if (!el || !el.style || typeof el.style.setProperty !== 'function') return;
+    el.style.setProperty('--iv-black', C.black);
+    el.style.setProperty('--iv-bg', C.bg);
+    el.style.setProperty('--iv-text2', C.text2);
+  } catch (e) { /* 无 DOM 环境，忽略 */ }
+})();
+
+/* ------------------------------------------------------- 2. 数据表 · 塔 */
+/* 造价为「本级升级价」；累计价由 cum 数组给出（GDD §3.2–3.5 一致） */
+var TOWERS = {
+  A: {
+    id: 'A', name: '动能炮', sides: 4, color: PALETTE.tower.A, canHitAir: true, kind: 'single',
+    tag: '单体·可对空',
+    lv: [
+      { cost: 100, dmg: 8,  cdMs: 500, rng: 110 },
+      { cost: 90,  dmg: 15, cdMs: 450, rng: 120 },
+      { cost: 160, dmg: 26, cdMs: 400, rng: 130 }
+    ],
+    cum: [100, 190, 350]
+  },
+  B: {
+    id: 'B', name: '迫击炮', sides: 6, color: PALETTE.tower.B, canHitAir: false, kind: 'splash',
+    tag: '溅射·仅对地',
+    lv: [
+      { cost: 120, dmg: 22, cdMs: 1200, rng: 130, splash: 40 },
+      { cost: 110, dmg: 38, cdMs: 1100, rng: 140, splash: 45 },
+      { cost: 190, dmg: 62, cdMs: 1000, rng: 150, splash: 55 }
+    ],
+    cum: [120, 230, 420]
+  },
+  C: {
+    id: 'C', name: '冷凝塔', sides: 8, color: PALETTE.tower.C, canHitAir: true, kind: 'aura',
+    tag: '光环·减速',
+    lv: [
+      { cost: 90,  rng: 100, slow: 0.25, dps: 3 },
+      { cost: 80,  rng: 115, slow: 0.35, dps: 5 },
+      { cost: 150, rng: 130, slow: 0.45, dps: 8 }
+    ],
+    cum: [90, 170, 320]
+  },
+  D: {
+    id: 'D', name: '棱镜炮', sides: 3, color: PALETTE.tower.D, canHitAir: true, kind: 'pierce',
+    tag: '穿甲·可对空',
+    lv: [
+      { cost: 160, dmg: 48,  cdMs: 2000, rng: 160, pen: 0.55 },
+      { cost: 150, dmg: 84,  cdMs: 1900, rng: 172, pen: 0.65 },
+      { cost: 270, dmg: 150, cdMs: 1800, rng: 185, pen: 0.75 }
+    ],
+    cum: [160, 310, 580]
+  }
+};
+var TOWER_IDS = ['A', 'B', 'C', 'D'];
+
+/* ------------------------------------------------------- 3. 数据表 · 敌人 */
+var ENEMIES = {
+  GRUNT:    { id: 'GRUNT',    name: '普通兵', hp: 55,  spd: 45, arm: 0,  bounty: 7,   baseDmg: 1, shape: 'tri',    size: 16, color: PALETTE.enemy.GRUNT },
+  SPRINTER: { id: 'SPRINTER', name: '快速兵', hp: 40,  spd: 95, arm: 5,  bounty: 6,   baseDmg: 1, shape: 'diamond',size: 14, color: PALETTE.enemy.SPRINTER },
+  BULWARK:  { id: 'BULWARK',  name: '装甲兵', hp: 300, spd: 30, arm: 55, bounty: 20,  baseDmg: 2, shape: 'rect',   size: 11, color: PALETTE.enemy.BULWARK },
+  WASP:     { id: 'WASP',     name: '飞行兵', hp: 85,  spd: 75, arm: 15, bounty: 11,  baseDmg: 1, shape: 'vwing',  size: 12, color: PALETTE.enemy.WASP, flying: true },
+  WARDEN:   { id: 'WARDEN',   name: '护盾兵', hp: 160, spd: 36, arm: 20, bounty: 15,  baseDmg: 1, shape: 'hex',    size: 16, color: PALETTE.enemy.WARDEN, auraR: 90, auraMul: 0.6, healMs: 4000, healPct: 0.08 },
+  BOSS:     { id: 'BOSS',     name: '铁幕爬行者', hp: 0, spd: 22, arm: 50, bounty: 130, baseDmg: 5, shape: 'boss', size: 28, color: PALETTE.enemy.BOSS, boss: true }
+};
+var WAVE_CODE = { g: 'GRUNT', s: 'SPRINTER', b: 'BULWARK', w: 'WASP', d: 'WARDEN', x: 'BOSS' };
+
+/* ------------------------------------------------------- 4. 数据表 · 地图 */
+var MAPS = {
+  M1: {
+    id: 'M1', name: '峡谷关隘', sub: '单路 S 形 · 教学图', k: 0.16,
+    baseHP: 20, gold: 320, clearA: 25, clearB: 8, baseTP: 16, diff: 1,
+    paths: [[[11.7, 152], [340, 152], [340, 472], [700, 472], [860, 312], [940, 512]]],
+    base: [940, 512],
+    pts: [[20, 8], [6, 3], [10, 8], [15, 8], [2, 0], [23, 8], [7, 4], [12, 7], [21, 3], [10, 0], [6, 11], [23, 13], [0, 4], [12, 12]],
+    airSpawn: 'lane'
+  },
+  M2: {
+    id: 'M2', name: '双流枢纽', sub: '双路并行 · Boss 只走 A 路', k: 0.19,
+    baseHP: 20, gold: 300, clearA: 25, clearB: 9, baseTP: 24, diff: 2,
+    paths: [
+      [[-110, 112], [260, 112], [260, 212], [860, 212], [940, 212], [940, 362]],
+      [[20, 592], [380, 592], [380, 392], [640, 392], [640, 542], [930, 542], [930, 462], [940, 462], [940, 362]]
+    ],
+    base: [940, 362],
+    /* kind: 0=A 专属 1=B 专属 2=中枢共享 */
+    pts: [[8, 5, 2], [10, 5, 2], [12, 5, 2], [14, 5, 2], [16, 5, 2], [17, 5, 2],
+          [7, 1, 0], [15, 2, 0], [19, 4, 0], [0, 2, 0], [24, 3, 0], [11, 2, 0],
+          [15, 12, 1], [0, 11, 1], [24, 11, 1], [8, 7, 1], [10, 12, 1], [17, 7, 1]],
+    airSpawn: 'lane'
+  },
+  M3: {
+    id: 'M3', name: '穹顶裂隙', sub: '地面单路 + 直线空袭 · 15 HP', k: 0.22,
+    baseHP: 15, gold: 380, clearA: 30, clearB: 10, baseTP: 36, diff: 3,
+    paths: [[[-180, 592], [60, 592], [300, 592], [480, 592], [480, 392], [720, 392], [720, 192], [940, 192], [940, 272]]],
+    base: [940, 272],
+    /* 第 4 位 = 1 表示高台（RNG ×1.15，仅可建 A / D） */
+    pts: [[5, 11, 0, 0], [2, 7, 0, 0], [11, 6, 0, 0], [16, 6, 0, 0], [19, 4, 0, 0], [21, 1, 0, 0],
+          [22, 4, 0, 0], [24, 6, 0, 0], [21, 4, 0, 0], [23, 1, 0, 0], [16, 1, 0, 0], [13, 1, 0, 0],
+          [15, 1, 0, 1], [15, 2, 0, 1], [15, 3, 0, 1], [15, 4, 0, 1]],
+    airSpawn: 'border',
+    /* 盲区声明段（GDD §7.1：240px 与 180px），实际斜纹按「点位最大射程」在载入时求解 */
+    blindDecl: [[[60, 592], [300, 592]], [[300, 592], [480, 592]]]
+  }
+};
+var MAP_IDS = ['M1', 'M2', 'M3'];
+
+/* ----------------------------------------------------- 5. 数据表 · 波次编排 */
+/* 键：g=普通 s=快速 b=装甲 w=飞行 d=护盾 x=Boss ｜ bossHP 为单只固定 HP */
+var WAVES = {
+  M1: [
+    { g: 8 }, { g: 9, s: 3 }, { g: 12, s: 4 }, { g: 10, s: 6, b: 1 },
+    { g: 16, b: 2 }, { x: 1, g: 8, bossHP: 1800 }, { s: 14, b: 3 }, { w: 10, g: 12 },
+    { g: 14, w: 6, d: 2 }, { b: 6, s: 8 }, { w: 12, g: 14, d: 3 },
+    { x: 2, g: 16, w: 6, bossHP: 2600 }
+  ],
+  M2: [
+    { A: { g: 8 } },
+    { A: { g: 6, s: 2 }, B: { g: 3 } },
+    { A: { g: 8 }, B: { s: 8 } },
+    { A: { b: 1, g: 4 }, B: { g: 8, s: 3 } },
+    { A: { g: 10 }, B: { w: 6, g: 6 } },
+    { A: { x: 1, g: 6, bossHP: 2400 }, B: { s: 8, g: 4 } },
+    { A: { b: 4 }, B: { s: 12 } },
+    { A: { w: 8, g: 8 }, B: { d: 2, g: 8 } },
+    { A: { b: 5, g: 6 }, B: { w: 10, s: 8 } },
+    { A: { b: 6, g: 6 }, B: { g: 10, s: 6 } },
+    { A: { d: 3, w: 8 }, B: { g: 16, s: 8 } },
+    { A: { x: 2, b: 2, w: 6, bossHP: 3400 }, B: { w: 8, g: 8 } }
+  ],
+  M3: [
+    { g: 10 }, { g: 6, w: 4 }, { s: 6, w: 6 }, { g: 8, w: 7 }, { b: 2, w: 10 },
+    { x: 1, w: 10, g: 8, bossHP: 3000 }, { w: 18, s: 12 }, { b: 5, d: 2, w: 8 },
+    { w: 16, g: 12 }, { b: 4, w: 10, d: 3 }, { w: 20, s: 12 },
+    { x: 2, w: 12, b: 4, bossHP: 3800 }
+  ]
+};
+/* 出怪间隔序列（GDD §4.4，三图共用；M2 双路各自按此序列） */
+var WAVE_GAP = [1500, 1400, 1300, 1200, 1100, 1000, 950, 900, 850, 800, 750, 700];
+
+/* ----------------------------------------------------- 6. 数据表 · 科技树 */
+var TECH = {
+  F1: { id: 'F1', branch: 'F', name: '弹道校准', cost: 10, pre: null, desc: '全塔伤害 ×1.08' },
+  F2: { id: 'F2', branch: 'F', name: '高爆装药', cost: 14, pre: 'F1', desc: '迫击炮溅射半径 ×1.25，边缘衰减 0.60→0.75' },
+  F3: { id: 'F3', branch: 'F', name: '钨芯穿甲', cost: 16, pre: 'F1', desc: '全塔穿甲 +0.20（上限 0.95）' },
+  E1: { id: 'E1', branch: 'E', name: '回收协议', cost: 10, pre: null, desc: '出售回收率 0.70→0.85' },
+  E2: { id: 'E2', branch: 'E', name: '赏金增幅', cost: 14, pre: 'E1', desc: '击杀赏金 ×1.12' },
+  E3: { id: 'E3', branch: 'E', name: '资本利息', cost: 12, pre: 'E1', desc: '利息率 4%→6%，上限 40→70' },
+  D1: { id: 'D1', branch: 'D', name: '复合装甲', cost: 14, pre: null, desc: '基地 HP +5' },
+  D2: { id: 'D2', branch: 'D', name: '战地维修', cost: 20, pre: 'D1', desc: '每波结束恢复 1 点基地 HP' }
+};
+var BRANCH_ORDER = { F: ['F1', 'F2', 'F3'], E: ['E1', 'E2', 'E3'], D: ['D1', 'D2'] };
+var BRANCH_NAME = { F: '火力', E: '经济', D: '防线' };
+var TECH_IDS = ['F1', 'F2', 'F3', 'E1', 'E2', 'E3', 'D1', 'D2'];
+
+/* ------------------------------------------------------------ 7. 存档系统 */
+var save = {
+  version: VERSION, tp: 0,
+  tech: { F1: 0, F2: 0, F3: 0, E1: 0, E2: 0, E3: 0, D1: 0, D2: 0 },
+  firstClear: { M1: 0, M2: 0, M3: 0 },
+  bestWave: { M1: 0, M2: 0, M3: 0 },
+  totalKills: 0,
+  settings: { reducedMotion: 0, colorblind: 'off', uiScale: 1 }
+};
+var saveWarn = '';          // 读档损坏提示（只提示一次）
+function defaultSave() {
+  return {
+    version: VERSION, tp: 0,
+    tech: { F1: 0, F2: 0, F3: 0, E1: 0, E2: 0, E3: 0, D1: 0, D2: 0 },
+    firstClear: { M1: 0, M2: 0, M3: 0 },
+    bestWave: { M1: 0, M2: 0, M3: 0 },
+    totalKills: 0,
+    settings: { reducedMotion: 0, colorblind: 'off', uiScale: 1 }
+  };
+}
+function num(v, d) { return (typeof v === 'number' && isFinite(v)) ? v : d; }
+function bool(v) { return v === true || v === 1 ? 1 : 0; }
+function loadSave() {
+  var raw = null;
+  try { raw = window.localStorage.getItem(SAVE_KEY); } catch (e) { raw = null; }
+  if (!raw) { save = defaultSave(); return; }
+  var o = null;
+  try { o = JSON.parse(raw); } catch (e) { o = null; }
+  if (!o || typeof o !== 'object') {
+    save = defaultSave();
+    saveWarn = '存档已损坏，已重置为初始态。';
+    try { window.localStorage.removeItem(SAVE_KEY); } catch (e2) {}
+    return;
+  }
+  var d = defaultSave();
+  var out = defaultSave();
+  out.version = VERSION;
+  out.tp = Math.max(0, Math.floor(num(o.tp, 0)));
+  out.totalKills = Math.max(0, Math.floor(num(o.totalKills, 0)));
+  var i, k;
+  for (i = 0; i < TECH_IDS.length; i++) { k = TECH_IDS[i]; out.tech[k] = bool(o.tech && o.tech[k]); }
+  for (i = 0; i < MAP_IDS.length; i++) {
+    k = MAP_IDS[i];
+    out.firstClear[k] = bool(o.firstClear && o.firstClear[k]);
+    out.bestWave[k] = Math.max(0, Math.min(12, Math.floor(num(o.bestWave && o.bestWave[k], 0))));
+  }
+  var st = o.settings || {};
+  out.settings.reducedMotion = bool(st.reducedMotion);
+  out.settings.colorblind = (st.colorblind === 'deuter' || st.colorblind === 'trit') ? st.colorblind : 'off';
+  out.settings.uiScale = (st.uiScale === 1.25 || st.uiScale === 1.5) ? st.uiScale : 1;
+  out.version = num(o.version, VERSION) === VERSION ? VERSION : VERSION;
+  save = out;
+  void d;
+}
+function writeSave() {
+  try { window.localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) {}
+}
+function resetSave() {
+  save = defaultSave();
+  applyTheme('off');
+  UI.reducedMotion = false;
+  try { window.localStorage.removeItem(SAVE_KEY); } catch (e) {}
+  writeSave();
+  saveWarn = '';
+}
+
+/* ----------------------------------------------------- 8. 科技加成（生效值） */
+/* 每帧不重算，仅当科技变化时刷新；供给塔/敌人/经济系统读取 */
+var MOD = {
+  dmgMul: 1, splashR: 1, splashEdge: 0.60, penAdd: 0,
+  refund: 0.70, bountyMul: 1, interest: 0.04, interestCap: 40,
+  baseHPAdd: 0, repairPerWave: 0
+};
+function recomputeTech() {
+  var t = save.tech;
+  MOD.dmgMul = t.F1 ? 1.08 : 1;
+  MOD.splashR = t.F2 ? 1.25 : 1;
+  MOD.splashEdge = t.F2 ? 0.75 : 0.60;
+  MOD.penAdd = t.F3 ? 0.20 : 0;
+  MOD.refund = t.E1 ? 0.85 : 0.70;
+  MOD.bountyMul = t.E2 ? 1.12 : 1;
+  MOD.interest = t.E3 ? 0.06 : 0.04;
+  MOD.interestCap = t.E3 ? 70 : 40;
+  MOD.baseHPAdd = t.D1 ? 5 : 0;
+  MOD.repairPerWave = t.D2 ? 1 : 0;
+}
+function techCount() {
+  var n = 0, i;
+  for (i = 0; i < TECH_IDS.length; i++) if (save.tech[TECH_IDS[i]]) n++;
+  return n;
+}
+
+/* -------------------------------------------------------- 9. 全局 UI 设置 */
+var UI = { reducedMotion: false, colorblind: 'off', uiScale: 1 };
+function applySettings() {
+  UI.reducedMotion = !!save.settings.reducedMotion;
+  UI.colorblind = save.settings.colorblind || 'off';
+  UI.uiScale = save.settings.uiScale === 1.25 || save.settings.uiScale === 1.5 ? save.settings.uiScale : 1;
+  applyTheme(UI.colorblind);
+  if (typeof layoutHUD === 'function') layoutHUD();
+  if (typeof buildHatch === 'function') buildHatch();
+  bgDirty = true;
+}
+/* 动效时长/粒子数在「减少动效」下被压缩（art-bible A5） */
+/* palette 色值 → rgba 字符串（供 pattern / 低透明度填充使用） */
+function rgba(hex, a) {
+  var h = hex.charAt(0) === '#' ? hex.slice(1) : hex;
+  if (h.length === 3) h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+  var r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+}
+function fxDur(ms) { return UI.reducedMotion ? Math.min(ms, 120) : ms; }
+function fxCount(n) { return UI.reducedMotion ? Math.min(n, 3) : n; }
+function shakeMag() { return UI.reducedMotion ? 0 : 1; }
+/* UI 缩放只作用于 HUD 字号 */
+function fs(px) { var v = Math.round(px * UI.uiScale); return v < 12 ? 12 : v; }
+
+/* ============================================================ 10. 画布/视口 */
+var canvas = document.getElementById('stage');
+var ctx = canvas.getContext('2d', { alpha: false });
+var VIEW = { scale: 1, ox: 0, oy: 0, dpr: 1, w: 1280, h: 720 };
+
+function resize() {
+  var w = window.innerWidth || document.documentElement.clientWidth || LW;
+  var h = window.innerHeight || document.documentElement.clientHeight || LH;
+  var dpr = window.devicePixelRatio || 1;
+  if (dpr > 2.5) dpr = 2.5;                    // 防止超高 DPR 下填充率爆炸
+  VIEW.dpr = dpr; VIEW.w = w; VIEW.h = h;
+  canvas.width = Math.max(1, Math.round(w * dpr));
+  canvas.height = Math.max(1, Math.round(h * dpr));
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  var s = Math.min(w / LW, h / LH);
+  VIEW.scale = s;
+  VIEW.ox = (w - LW * s) / 2;
+  VIEW.oy = (h - LH * s) / 2;
+  bgDirty = true;
+}
+window.addEventListener('resize', function () { resize(); });
+window.addEventListener('orientationchange', function () { setTimeout(resize, 120); });
+
+/* 屏幕坐标 → 逻辑坐标 */
+function toLogic(clientX, clientY) {
+  var r = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - r.left - VIEW.ox) / VIEW.scale,
+    y: (clientY - r.top - VIEW.oy) / VIEW.scale
+  };
+}
+
+/* ============================================================== 11. 绘制基元 */
+function fillRect(x, y, w, h, col) { ctx.fillStyle = col; ctx.fillRect(x, y, w, h); }
+function strokeRect(x, y, w, h, col, lw) {
+  ctx.strokeStyle = col; ctx.lineWidth = lw || 1;
+  ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
+}
+function line(x1, y1, x2, y2, col, lw) {
+  ctx.strokeStyle = col; ctx.lineWidth = lw || 1;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+function circle(x, y, r, col) {
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+}
+function ring(x, y, r, col, lw) {
+  ctx.strokeStyle = col; ctx.lineWidth = lw || 1;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
+}
+function arcRing(x, y, r, a0, a1, col, lw) {
+  ctx.strokeStyle = col; ctx.lineWidth = lw || 1;
+  ctx.beginPath(); ctx.arc(x, y, r, a0, a1); ctx.stroke();
+}
+/* 正多边形顶点（sides=4 → 正方形，尖端朝上由 rot 控制） */
+function polyPath(cx, cy, r, sides, rot) {
+  var i, a;
+  ctx.beginPath();
+  for (i = 0; i < sides; i++) {
+    a = rot + i * TAU / sides;
+    if (i === 0) ctx.moveTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    else ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+  }
+  ctx.closePath();
+}
+/* 双层辉光：外圈 α0.15 + 'lighter'，禁止 shadowBlur（art-bible §4.4.5） */
+function glowCircle(x, y, r, col, alpha) {
+  var g = ctx.globalAlpha;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = (alpha === undefined ? 0.15 : alpha);
+  circle(x, y, r * 1.6, col);
+  ctx.globalAlpha = 1;
+  circle(x, y, r, col);
+  ctx.globalAlpha = g;
+  ctx.globalCompositeOperation = 'source-over';
+}
+function text(str, x, y, size, col, align, weight, mono) {
+  ctx.font = (weight || 400) + ' ' + fs(size) + 'px ' + (mono ? MONO : FONT);
+  ctx.fillStyle = col;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(str, x, y);
+}
+function textW(str, size, weight, mono) {
+  ctx.font = (weight || 400) + ' ' + fs(size) + 'px ' + (mono ? MONO : FONT);
+  return ctx.measureText(str).width;
+}
+function roundRectPath(x, y, w, h, r) {
+  var rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y); ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr); ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h); ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr); ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
+}
+function dashCircle(x, y, r, col, lw, dash) {
+  ctx.save();
+  ctx.setLineDash(dash || [4, 4]);
+  ring(x, y, r, col, lw || 1);
+  ctx.restore();
+}
+/* 焦点环：3px 强调色 + 四角直角括号（与悬停同规格，art-bible A7） */
+function focusBrackets(x, y, w, h, col) {
+  var L = 8;
+  strokeRect(x - 1, y - 1, w + 2, h + 2, col, 3);
+  ctx.strokeStyle = col; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(x - 5, y - 5 + L); ctx.lineTo(x - 5, y - 5); ctx.lineTo(x - 5 + L, y - 5);
+  ctx.moveTo(x + w + 5 - L, y - 5); ctx.lineTo(x + w + 5, y - 5); ctx.lineTo(x + w + 5, y - 5 + L);
+  ctx.moveTo(x + w + 5, y + h + 5 - L); ctx.lineTo(x + w + 5, y + h + 5); ctx.lineTo(x + w + 5 - L, y + h + 5);
+  ctx.moveTo(x - 5 + L, y + h + 5); ctx.lineTo(x - 5, y + h + 5); ctx.lineTo(x - 5, y + h + 5 - L);
+  ctx.stroke();
+}
+/* 禁用符：中央斜十字（不依赖颜色，art-bible §3.4） */
+function disabledCross(cx, cy, r, col) {
+  var s = r * 0.52;
+  ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(cx - s, cy - s); ctx.lineTo(cx + s, cy + s);
+  ctx.moveTo(cx + s, cy - s); ctx.lineTo(cx - s, cy + s);
+  ctx.stroke();
+}
+
+/* 斜纹图案（盲区警示）——一次性预建，运行期复用 */
+var hatchPattern = null;
+function buildHatch() {
+  var pc = document.createElement('canvas');
+  pc.width = 14; pc.height = 14;
+  var p = pc.getContext('2d');
+  p.clearRect(0, 0, 14, 14);
+  p.strokeStyle = rgba(TH.warn, 0.50);       // α 不得低于 0.50（对路面 3.36:1 的唯一达标值）
+  p.lineWidth = 4;
+  p.beginPath();
+  p.moveTo(-4, 18); p.lineTo(18, -4);
+  p.stroke();
+  hatchPattern = ctx.createPattern(pc, 'repeat');
+}
+
+/* ============================================================= 12. 音频合成 */
+var AUD = { ac: null, master: null, voices: 0, muted: false };
+function initAudio() {
+  if (AUD.ac) { if (AUD.ac.state === 'suspended') { try { AUD.ac.resume(); } catch (e) {} } return; }
+  var AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  try {
+    AUD.ac = new AC();
+    AUD.master = AUD.ac.createGain();
+    AUD.master.gain.value = 0.16;
+    AUD.master.connect(AUD.ac.destination);
+  } catch (e) { AUD.ac = null; }
+}
+function tone(freq, durMs, type, vol, slideTo, delayMs) {
+  if (!AUD.ac || AUD.muted) return;
+  if (AUD.voices > 18) return;                  // 并发限制，避免 CPU 抖动
+  var t0 = AUD.ac.currentTime + (delayMs || 0) / 1000;
+  var d = Math.max(0.03, durMs / 1000);
+  var o = AUD.ac.createOscillator();
+  var g = AUD.ac.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, t0);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(40, slideTo), t0 + d);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.001, vol || 0.2), t0 + 0.008);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+  o.connect(g); g.connect(AUD.master);
+  AUD.voices++;
+  o.onended = function () { AUD.voices--; try { o.disconnect(); g.disconnect(); } catch (e) {} };
+  o.start(t0); o.stop(t0 + d + 0.02);
+}
+function sfx(name) {
+  switch (name) {
+    case 'shootA': tone(680, 60, 'square', 0.10, 420); break;
+    case 'shootB': tone(150, 130, 'sawtooth', 0.14, 70); break;
+    case 'shootD': tone(980, 120, 'triangle', 0.13, 300); break;
+    case 'hit': tone(320, 45, 'square', 0.05, 240); break;
+    case 'kill': tone(520, 90, 'triangle', 0.09, 880); break;
+    case 'leak': tone(180, 420, 'sawtooth', 0.20, 60); break;
+    case 'wave': tone(440, 160, 'triangle', 0.12, 660); break;
+    case 'boss': tone(90, 900, 'sawtooth', 0.18, 55); break;
+    case 'summon': tone(240, 220, 'sawtooth', 0.14, 520); break;   // A6：Boss 召唤的音效等价物
+    case 'build': tone(300, 90, 'square', 0.12, 520); break;
+    case 'upgrade': tone(520, 80, 'triangle', 0.12, 780); tone(780, 110, 'triangle', 0.10, 1040, 70); break;
+    case 'sell': tone(420, 90, 'square', 0.10, 220); break;
+    case 'error': tone(140, 110, 'square', 0.10, 110); break;
+    case 'tech': tone(560, 90, 'triangle', 0.13, 840); tone(840, 140, 'triangle', 0.11, 1120, 80); break;
+    case 'click': tone(760, 40, 'square', 0.07, 900); break;
+    case 'lose': tone(220, 700, 'sawtooth', 0.18, 70); break;
+    case 'win': tone(520, 160, 'triangle', 0.14, 780); tone(660, 160, 'triangle', 0.13, 990, 150); tone(880, 300, 'triangle', 0.13, 1320, 300); break;
+  }
+}
+
+/* ========================================================== 13. 粒子对象池 */
+var PMAX = 800;
+var particles = new Array(PMAX);
+var pCursor = 0, pAlive = 0;
+(function initParticles() {
+  for (var i = 0; i < PMAX; i++) {
+    particles[i] = { alive: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, size: 2, color: C.white, grav: 0, kind: 0 };
+  }
+})();
+function pSpawn(x, y, vx, vy, lifeMs, size, color, kind) {
+  if (pAlive >= 600) {                       // 硬上限 600，最旧优先淘汰
+    var j, dropped = 0;
+    for (j = 0; j < PMAX && dropped < 1; j++) {
+      if (particles[j].alive) { particles[j].alive = false; dropped++; pAlive--; }
+    }
+  }
+  var p = null, i;
+  for (i = 0; i < PMAX; i++) {
+    var idx = (pCursor + i) % PMAX;
+    if (!particles[idx].alive) { p = particles[idx]; pCursor = (idx + 1) % PMAX; break; }
+  }
+  if (!p) return;
+  p.alive = true; p.x = x; p.y = y; p.vx = vx; p.vy = vy;
+  p.life = fxDur(lifeMs); p.max = p.life; p.size = size; p.color = color;
+  p.kind = kind || 0; p.grav = 0;
+  pAlive++;
+}
+function pBurst(x, y, n, color, speed, size, lifeMs) {
+  var count = fxCount(n), i, a, sp;
+  for (i = 0; i < count; i++) {
+    a = Math.random() * TAU;
+    sp = speed * (0.35 + Math.random() * 0.75);
+    pSpawn(x, y, Math.cos(a) * sp, Math.sin(a) * sp, lifeMs * (0.6 + Math.random() * 0.6), size, color, 0);
+  }
+}
+function pUpdate(dtMs) {
+  var i, p;
+  for (i = 0; i < PMAX; i++) {
+    p = particles[i];
+    if (!p.alive) continue;
+    p.life -= dtMs;
+    if (p.life <= 0) { p.alive = false; pAlive--; continue; }
+    p.x += p.vx * dtMs / 1000;
+    p.y += p.vy * dtMs / 1000;
+    p.vx *= 0.965; p.vy *= 0.965;
+  }
+}
+function pDraw() {
+  var i, p, a;
+  for (i = 0; i < PMAX; i++) {
+    p = particles[i];
+    if (!p.alive) continue;
+    a = p.life / p.max;
+    ctx.globalAlpha = a < 0 ? 0 : a;
+    if (p.kind === 0) {
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    } else {
+      circle(p.x, p.y, p.size * (0.35 + 0.65 * a), p.color);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ======================================================== 14. 路径几何工具 */
+function pathMetrics(pts) {
+  var cum = [0], i, t = 0;
+  for (i = 1; i < pts.length; i++) { t += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); cum.push(t); }
+  return { pts: pts, cum: cum, total: t };
+}
+function pathPoint(pm, dist) {
+  var pts = pm.pts, cum = pm.cum, i;
+  if (dist <= 0) return { x: pts[0][0], y: pts[0][1], a: Math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]) };
+  if (dist >= pm.total) {
+    var n = pts.length - 1;
+    return { x: pts[n][0], y: pts[n][1], a: Math.atan2(pts[n][1] - pts[n - 1][1], pts[n][0] - pts[n - 1][0]) };
+  }
+  for (i = 1; i < cum.length; i++) {
+    if (dist <= cum[i]) {
+      var seg = cum[i] - cum[i - 1];
+      var t2 = seg > 0 ? (dist - cum[i - 1]) / seg : 0;
+      return {
+        x: pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * t2,
+        y: pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * t2,
+        a: Math.atan2(pts[i][1] - pts[i - 1][1], pts[i][0] - pts[i - 1][0])
+      };
+    }
+  }
+  var m = pts.length - 1;
+  return { x: pts[m][0], y: pts[m][1], a: 0 };
+}
+
+/* ============================================================ 15. 地图构建 */
+function cellCenter(gx, gy) { return { x: GRID_OX + gx * CELL + CELL / 2, y: GRID_OY + gy * CELL + CELL / 2 }; }
+
+function buildMap(mapId) {
+  var def = MAPS[mapId];
+  var m = {
+    id: def.id, name: def.name, sub: def.sub, def: def,
+    lanes: [], base: { x: def.base[0], y: def.base[1] },
+    sites: [], blind: [], blindDecl: [],
+    k: def.k, baseHPMax: 0
+  };
+  var i, j;
+  for (i = 0; i < def.paths.length; i++) m.lanes.push(pathMetrics(def.paths[i]));
+
+  /* 点位 */
+  for (i = 0; i < def.pts.length; i++) {
+    var p = def.pts[i];
+    var c = cellCenter(p[0], p[1]);
+    var kind = p.length > 2 ? p[2] : 0;
+    var high = p.length > 3 ? p[3] : 0;
+    m.sites.push({
+      idx: i, gx: p[0], gy: p[1], x: c.x, y: c.y,
+      kind: kind, high: high, tower: null,
+      maxRng: high ? 185 * 1.15 : 185      // 该点位「理论最大射程」→ 判定盲区
+    });
+  }
+  /* 盲区求解：以点位最大射程对所有地面路径采样，取不可覆盖的连续段 */
+  var blind = [];
+  for (i = 0; i < m.lanes.length; i++) {
+    var pm = m.lanes[i], step = 4, d, runs = [], cur = null;
+    for (d = 0; d <= pm.total; d += step) {
+      var pp = pathPoint(pm, d), covered = false;
+      for (j = 0; j < m.sites.length; j++) {
+        var s = m.sites[j];
+        if (Math.hypot(pp.x - s.x, pp.y - s.y) <= s.maxRng) { covered = true; break; }
+      }
+      if (!covered) {
+        if (cur && d - cur.e <= step * 1.5) cur.e = d;
+        else { cur = { s: d, e: d, lane: i }; runs.push(cur); }
+      }
+    }
+    for (j = 0; j < runs.length; j++) if (runs[j].e - runs[j].s > 24) blind.push(runs[j]);
+  }
+  m.blind = blind;
+  if (def.blindDecl) {
+    for (i = 0; i < def.blindDecl.length; i++) {
+      m.blindDecl.push({ a: { x: def.blindDecl[i][0][0], y: def.blindDecl[i][0][1] }, b: { x: def.blindDecl[i][1][0], y: def.blindDecl[i][1][1] } });
+    }
+  }
+  return m;
+}
+
+/* 点位是否被覆盖于某点的射程外（用于建造提示） */
+function siteTowerAt(m, x, y) {
+  for (var i = 0; i < m.sites.length; i++) {
+    var s = m.sites[i];
+    if (Math.abs(x - s.x) <= 20 && Math.abs(y - s.y) <= 20) return s;
+  }
+  return null;
+}
+
+/* ============================================================ 16. 局势状态 */
+var G = {
+  state: 'MENU',                 // MENU / PLAY / RESULT / TECH
+  mapId: 'M1',
+  map: null,
+  gold: 0, baseHP: 0, baseMax: 0,
+  wave: 0,                       // 当前波次编号（1..12；0 = 尚未开始）
+  cleared: 0,                    // 已清波次
+  phase: 'PREP',                 // PREP（波间间隙） / WAVE / OVER
+  gapMs: 0,                      // 波间倒计时已用时（第三套时钟：仅 timeScale>0 时按 rawDt 累加）
+  enemies: [], towers: [], shots: [],
+  queues: [],
+  speed: 1, paused: false,
+  battleMs: 0,
+  selSite: null, selTower: null, hoverSite: null,
+  banner: { text: '', ms: 0, max: 0 },
+  flashMs: 0, flashMax: 0,
+  shakeMs: 0, shakeMagPx: 0,
+  bossFlashMs: 0,
+  result: null,
+  kills: 0, leaks: {}, leaksTotal: 0,
+  hintMs: 0, hintText: '',
+  lastDominantArmor: 0,
+  buildType: 'A',                // 建造栏当前选择
+  pendingSpawn: []
+};
+function resetGameState() {
+  G.map = null; G.gold = 0; G.baseHP = 0; G.baseMax = 0; G.wave = 0; G.cleared = 0;
+  G.phase = 'PREP'; G.gapMs = 0; G.enemies.length = 0; G.towers.length = 0;
+  G.queues.length = 0; G.speed = 1; G.paused = false; G.battleMs = 0;
+  G.selSite = null; G.selTower = null; G.hoverSite = null;
+  G.banner.text = ''; G.banner.ms = 0; G.flashMs = 0; G.shakeMs = 0;
+  G.result = null; G.kills = 0; G.leaks = {}; G.leaksTotal = 0;
+  G.hintMs = 0; G.pendingSpawn.length = 0; G.bossFlashMs = 0;
+  var i;
+  for (i = 0; i < PMAX; i++) particles[i].alive = false;
+  pAlive = 0;
+  for (i = 0; i < SHOT_MAX; i++) shots[i].active = false;
+}
+
+/* ========================================================== 17. 伤害公式 */
+/* GDD §3.1 / §4.2 唯一公式：ARM_eff=ARM×(1−PEN)；MIT=ARM_eff/(ARM_eff+50) */
+function dmgCalc(dmg, arm, pen) {
+  var pe = Math.min(0.95, Math.max(0, pen || 0));
+  var a = Math.max(0, arm || 0);
+  var armEff = Math.max(0, a * (1 - pe));
+  var mit = armEff / (armEff + 50);
+  var out = Math.max(1, Math.round(dmg * (1 - mit)));
+  return { armEff: armEff, mit: mit, out: out };
+}
+function effPen(basePen) { return Math.min(0.95, (basePen || 0) + MOD.penAdd); }
+
+/* ============================================================ 18. 敌人系统 */
+var ENEMY_R = { GRUNT: 9, SPRINTER: 8, BULWARK: 8, WASP: 9, WARDEN: 12, BOSS: 24 };
+var nextEid = 1;
+
+function waveHP(baseHP, wave) { return baseHP * (1 + G.map.k * (wave - 1)); }
+
+function spawnEnemy(type, lane, opts) {
+  opts = opts || {};
+  var def = ENEMIES[type];
+  if (!def) return null;
+  var en = {
+    eid: nextEid++, type: type, def: def,
+    hp: 0, maxHp: 0, spd: def.spd, baseSpd: def.spd, arm: def.arm,
+    bountyBase: def.bounty, baseDmg: def.baseDmg,
+    isFlying: !!def.flying, isBoss: !!def.boss,
+    lane: lane || 0, prog: 0, x: 0, y: 0, a: 0,
+    slowPct: 0, frost: 0, auraMul: 1, mortarSlowMs: 0, mortarSlowPct: 0,
+    alive: true, dead: false, tMs: Math.random() * 1000,
+    summonMarks: 0, summonPending: 0, summonTgMs: 0, ringMs: 0,
+    isSummon: !!opts.isSummon, bountyZero: !!opts.bountyZero,
+    flightTotal: 1, sx: 0, sy: 0, tx: 0, ty: 0,
+    hitFlash: 0, healMs: 0, pulse: Math.random() * 900
+  };
+  if (def.boss) {
+    en.maxHp = opts.hp || 1800;
+  } else {
+    en.maxHp = waveHP(def.hp, G.wave || 1);
+  }
+  en.hp = en.maxHp;
+
+  var m = G.map;
+  if (en.isFlying) {
+    if (m.def.airSpawn === 'border') {
+      en.sx = -10; en.sy = 160 + Math.random() * 400;      // M3：左边界 y∈[160,560]
+    } else {
+      var lp = m.lanes[lane] || m.lanes[0];
+      en.sx = lp.pts[0][0] - 20; en.sy = lp.pts[0][1];
+    }
+    en.tx = m.base.x; en.ty = m.base.y;
+    en.flightTotal = Math.hypot(en.tx - en.sx, en.ty - en.sy);
+    en.x = en.sx; en.y = en.sy;
+    en.a = Math.atan2(en.ty - en.sy, en.tx - en.sx);
+  } else {
+    var pm = m.lanes[lane] || m.lanes[0];
+    en.prog = opts.startDist || 0;
+    var pp = pathPoint(pm, en.prog);
+    en.x = pp.x; en.y = pp.y; en.a = pp.a;
+  }
+  G.enemies.push(en);
+  return en;
+}
+
+function queueSpawn(type, lane, opts) {
+  G.pendingSpawn.push({ type: type, lane: lane, opts: opts || {}, delayMs: 0 });
+}
+
+function applyDamage(en, rawDmg, pen, srcTag) {
+  if (!en.alive) return 0;
+  var arm = Math.max(0, en.arm - en.frost);
+  var r = dmgCalc(rawDmg, arm, pen);
+  var d = r.out;
+  if (en.auraMul < 1) d = Math.max(1, Math.round(d * en.auraMul));
+  en.hp -= d;
+  en.hitFlash = UI.reducedMotion ? 40 : 90;
+  if (en.hp <= 0) killEnemy(en);
+  else if (en.isBoss) checkBossSummon(en);
+  void srcTag;
+  return d;
+}
+function killEnemy(en) {
+  if (!en.alive) return;
+  en.alive = false; en.dead = true;
+  if (!en.isSummon) G.kills++;          /* 召唤物不计入击杀数（GDD 附录 5） */
+  var gold = en.bountyZero ? 0 : en.bountyBase;
+  if (gold > 0 && MOD.bountyMul > 1) gold = Math.max(gold + 1, Math.floor(gold * MOD.bountyMul));
+  if (gold > 0) G.gold += gold;
+  pBurst(en.x, en.y, en.isBoss ? 12 : 6, en.def.color, en.isBoss ? 190 : 96, en.isBoss ? 4 : 3, 320);
+  pBurst(en.x, en.y, en.isBoss ? 4 : 3, C.warn, 70, 2, 260);
+  sfx(en.isBoss ? 'boss' : 'kill');
+  if (en.isBoss) {
+    shakeT = fxDur(320); G.shakeMagPx = 6 * shakeMag();
+  }
+}
+/* 每损失 25% 最大 HP 召唤 2 只 GRUNT（赏金 0、不计击杀）。
+   ≥400ms 视觉预告期间 Boss 照常移动、照常受击、不禁足 —— 预告只是独立视觉计时器；
+   若在此冻结 Boss，400ms×3 = 1.2s 免费输出窗口会实质削弱它、破坏三图难度曲线。 */
+function checkBossSummon(en) {
+  var lostPct = 1 - en.hp / en.maxHp;
+  var marks = Math.min(3, Math.floor(lostPct / 0.25));
+  while (en.summonMarks < marks) {
+    en.summonMarks++;
+    en.summonPending += 2;
+    if (en.summonTgMs <= 0) en.summonTgMs = BOSS_TG_MS;
+    en.ringMs = BOSS_TG_MS;
+    pBurst(en.x, en.y, fxCount(8), C.wardenAura, 130, 2, fxDur(BOSS_TG_MS));
+    sfx('summon');
+  }
+}
+function leakEnemy(en) {
+  G.baseHP -= en.baseDmg;
+  G.leaks[en.type] = (G.leaks[en.type] || 0) + 1;
+  G.leaksTotal++;
+  en.alive = false; en.dead = true;
+  G.flashMs = fxDur(600); G.flashMax = G.flashMs;
+  shakeT = fxDur(320); G.shakeMagPx = 8 * shakeMag();
+  sfx('leak');
+  if (G.baseHP <= 0) { G.baseHP = 0; endGame(false); }
+}
+
+function updateEnemies(dtMs) {
+  var dt = dtMs / 1000, i, en;
+  for (i = 0; i < G.enemies.length; i++) {
+    en = G.enemies[i];
+    if (!en.alive) continue;
+    en.tMs += dtMs;
+    if (en.hitFlash > 0) en.hitFlash -= dtMs;
+    if (en.mortarSlowMs > 0) { en.mortarSlowMs -= dtMs; if (en.mortarSlowMs <= 0) en.mortarSlowPct = 0; }
+    if (en.ringMs > 0) en.ringMs = Math.max(0, en.ringMs - dtMs);
+    if (en.summonTgMs > 0) {
+      en.summonTgMs -= dtMs;
+      if (en.summonTgMs <= 0) {
+        en.summonTgMs = 0;
+        for (var sn = 0; sn < en.summonPending; sn++) {
+          queueSpawn('GRUNT', en.lane, {
+            startDist: Math.max(0, en.prog - 8 - sn * 14),
+            isSummon: true, bountyZero: true
+          });
+        }
+        en.summonPending = 0;
+      }
+    }
+
+    var slow = en.slowPct;
+    if (en.mortarSlowPct > slow) slow = en.mortarSlowPct;
+    if (en.isBoss && slow > 0.60) slow = 0.60;          // Boss 免疫：最高减速到原速 40%
+    var spd = en.baseSpd * (1 - slow);
+
+    if (en.isFlying) {
+      en.prog += spd * dt;
+      var t = en.prog / en.flightTotal;
+      en.x = en.sx + (en.tx - en.sx) * t;
+      en.y = en.sy + (en.ty - en.sy) * t;
+      if (t >= 1) { leakEnemy(en); continue; }
+    } else {
+      en.prog += spd * dt;
+      var pm = G.map.lanes[en.lane] || G.map.lanes[0];
+      if (en.prog >= pm.total) { leakEnemy(en); continue; }
+      var pp = pathPoint(pm, en.prog);
+      en.x = pp.x; en.y = pp.y; en.a = pp.a;
+    }
+  }
+  /* 补充召唤物 */
+  if (G.pendingSpawn.length) {
+    var list = G.pendingSpawn;
+    G.pendingSpawn = [];
+    for (i = 0; i < list.length; i++) spawnEnemy(list[i].type, list[i].lane, list[i].opts);
+  }
+  /* 清理死亡（swap-pop，零分配） */
+  for (i = G.enemies.length - 1; i >= 0; i--) {
+    if (!G.enemies[i].alive) {
+      var last = G.enemies[G.enemies.length - 1];
+      G.enemies[i] = last;
+      G.enemies.pop();
+    }
+  }
+}
+
+/* WARDEN 光环 + 治疗（在伤害结算前刷新，appendices §4） */
+function updateWardens(dtMs) {
+  var i, j, w, e, any = false;
+  for (i = 0; i < G.enemies.length; i++) {
+    e = G.enemies[i];
+    e.auraMul = 1;
+    if (e.type === 'WARDEN' && e.alive) any = true;
+  }
+  if (!any) return;
+  for (i = 0; i < G.enemies.length; i++) {
+    w = G.enemies[i];
+    if (!w.alive || w.type !== 'WARDEN') continue;
+    var R = w.def.auraR;
+    for (j = 0; j < G.enemies.length; j++) {
+      e = G.enemies[j];
+      if (!e.alive || e === w) continue;
+      if (Math.hypot(e.x - w.x, e.y - w.y) <= R) {
+        if (w.def.auraMul < e.auraMul) e.auraMul = w.def.auraMul;
+      }
+    }
+    /* 每 4s 治疗光环内 HP% 最低者 */
+    w.healMs += dtMs;
+    if (w.healMs >= w.def.healMs) {
+      w.healMs = 0;
+      var best = null, bestPct = 2;
+      for (j = 0; j < G.enemies.length; j++) {
+        e = G.enemies[j];
+        if (!e.alive) continue;
+        if (Math.hypot(e.x - w.x, e.y - w.y) > R) continue;
+        var pct = e.hp / e.maxHp;
+        if (pct < bestPct) { bestPct = pct; best = e; }
+      }
+      if (best && best.hp < best.maxHp) {
+        best.hp = Math.min(best.maxHp, best.hp + best.maxHp * w.def.healPct);
+        pBurst(best.x, best.y, 3, TH.ok, 30, 2, 260);
+      }
+    }
+  }
+}
+
+/* ============================================================== 19. 塔系统 */
+function towerRng(t) {
+  var r = t.def.lv[t.lv].rng;
+  return t.site.high ? r * 1.15 : r;
+}
+function towerDmg(t) {
+  var d = t.def.lv[t.lv].dmg || 0;
+  return d * MOD.dmgMul;
+}
+function towerPen(t) { return effPen(t.def.lv[t.lv].pen || 0); }
+function towerCd(t) { return t.def.lv[t.lv].cdMs; }
+function towerSlow(t) { return t.def.lv[t.lv].slow || 0; }
+function towerDps(t) { return t.def.lv[t.lv].dps || 0; }
+function towerSplash(t) { return (t.def.lv[t.lv].splash || 0) * MOD.splashR; }
+
+function makeTower(site, type) {
+  var def = TOWERS[type];
+  return {
+    tid: (makeTower._n = (makeTower._n || 0) + 1),
+    type: type, def: def, site: site, lv: 0,
+    cdMs: 0, angle: -Math.PI / 2, invested: def.cum[0],
+    lockEid: 0, lockMs: 0, spin: 0, flash: 0, upgradeFx: 0
+  };
+}
+
+function inRange(t, e) {
+  if (e.isFlying && !t.def.canHitAir) return false;
+  return Math.hypot(e.x - t.site.x, e.y - t.site.y) <= towerRng(t);
+}
+/* 选敌：射程内「最靠近基地」优先（prog 最大） */
+function pickTarget(t, excludeEid) {
+  var best = null, bestProg = -1, i, e;
+  for (i = 0; i < G.enemies.length; i++) {
+    e = G.enemies[i];
+    if (!e.alive || e.eid === excludeEid) continue;
+    if (e.isFlying && !t.def.canHitAir) continue;
+    if (Math.hypot(e.x - t.site.x, e.y - t.site.y) > towerRng(t)) continue;
+    var pr = e.isFlying ? e.prog / e.flightTotal : e.prog / (G.map.lanes[e.lane] || G.map.lanes[0]).total;
+    if (pr > bestProg) { bestProg = pr; best = e; }
+  }
+  return best;
+}
+
+/* 冷凝塔：光环减速取最大值（不叠加）+ 持续每目标伤害 */
+function updateCryo(t, dtMs) {
+  var R = towerRng(t), slow = towerSlow(t), dps = towerDps(t);
+  var frost = t.lv >= 2 ? 20 : 0;
+  var dt = dtMs / 1000, i, e;
+  for (i = 0; i < G.enemies.length; i++) {
+    e = G.enemies[i];
+    if (!e.alive) continue;
+    if (Math.hypot(e.x - t.site.x, e.y - t.site.y) > R) continue;
+    if (slow > e.slowPct) e.slowPct = slow;
+    if (frost > e.frost) e.frost = frost;
+    if (dps > 0) {
+      /* 光环伤害无视护甲（GDD §3.6：C 对 ARM0 / ARM55 每金币 DPS 相同），但仍受 WARDEN 光环影响 */
+      var amt = dps * dt;
+      if (e.auraMul < 1) amt *= e.auraMul;
+      e.hp -= amt;
+      if (e.hp <= 0) killEnemy(e);
+      else if (e.isBoss) checkBossSummon(e);
+    }
+  }
+}
+
+function updateTowers(dtMs) {
+  var i, t;
+  /* 先清空 C 影响标记，再由冷凝塔写入 */
+  for (i = 0; i < G.enemies.length; i++) { G.enemies[i].slowPct = 0; G.enemies[i].frost = 0; }
+  for (i = 0; i < G.towers.length; i++) {
+    t = G.towers[i];
+    t.spin += dtMs * 0.0000436 * TAU;       // 25°/s
+    if (t.flash > 0) t.flash -= dtMs;
+    if (t.upgradeFx > 0) t.upgradeFx -= dtMs;
+    if (t.def.kind === 'aura') { updateCryo(t, dtMs); continue; }
+
+    if (t.cdMs > 0) t.cdMs -= dtMs;
+    if (t.cdMs > 0) continue;
+
+    var target = pickTarget(t, 0);
+    if (!target) { t.lockEid = 0; t.lockMs = 0; continue; }
+
+    /* A 的「锁定」：对同一目标连续攻击 ≥2.0s 后 ×1.15 */
+    if (t.type === 'A' && t.lv >= 1) {
+      if (t.lockEid === target.eid) t.lockMs += towerCd(t);
+      else { t.lockEid = target.eid; t.lockMs = 0; }
+    }
+    var lockBonus = (t.type === 'A' && t.lv >= 1 && t.lockMs >= 2000) ? 1.15 : 1;
+
+    t.angle = Math.atan2(target.y - t.site.y, target.x - t.site.x);
+    t.cdMs = towerCd(t);
+    t.flash = 90;
+
+    if (t.type === 'A') {
+      sfx('shootA');
+      if (t.lv >= 2) {
+        /* 双联：2 枚弹丸各 50% 伤害，可分别选目标 */
+        fireBullet(t, target, towerDmg(t) * 0.5 * lockBonus);
+        var t2 = pickTarget(t, target.eid);
+        fireBullet(t, t2 || target, towerDmg(t) * 0.5 * lockBonus);
+      } else {
+        fireBullet(t, target, towerDmg(t) * lockBonus);
+      }
+    } else if (t.type === 'B') {
+      sfx('shootB');
+      fireShell(t, target);
+    } else if (t.type === 'D') {
+      sfx('shootD');
+      fireBeam(t, target);
+    }
+  }
+}
+
+/* =========================================================== 20. 弹道/弹丸 */
+var SHOT_MAX = 320;
+var shots = new Array(SHOT_MAX);
+(function () {
+  for (var i = 0; i < SHOT_MAX; i++) {
+    shots[i] = { active: false, kind: 0, x: 0, y: 0, sx: 0, sy: 0, tx: 0, ty: 0, vx: 0, vy: 0,
+      dmg: 0, pen: 0, splash: 0, color: C.white, eid: 0, tMs: 0, durMs: 0, mortar: false, slowPct: 0,
+      tower: null, lifeMs: 0, maxLife: 0, ageMs: 0, has2: false, tx2: 0, ty2: 0 };
+  }
+})();
+var shotCursor = 0;
+function allocShot() {
+  for (var i = 0; i < SHOT_MAX; i++) {
+    var idx = (shotCursor + i) % SHOT_MAX;
+    if (!shots[idx].active) { shotCursor = (idx + 1) % SHOT_MAX; return shots[idx]; }
+  }
+  return null;
+}
+function fireBullet(t, target, dmg) {
+  var s = allocShot(); if (!s) return;
+  s.active = true; s.kind = 1; s.mortar = false;
+  s.x = t.site.x; s.y = t.site.y - 6; s.sx = s.x; s.sy = s.y;
+  s.dmg = dmg; s.pen = towerPen(t); s.color = t.def.color; s.eid = target.eid;
+  s.tower = t; s.lifeMs = 0; s.maxLife = 900;
+  var d = Math.hypot(target.x - s.x, target.y - s.y);
+  s.vx = (target.x - s.x) / Math.max(0.001, d) * 1050;
+  s.vy = (target.y - s.y) / Math.max(0.001, d) * 1050;
+  pBurst(t.site.x + Math.cos(t.angle) * 12, t.site.y + Math.sin(t.angle) * 12, 3, t.def.color, 90, 2, 90);
+}
+function fireShell(t, target) {
+  var s = allocShot(); if (!s) return;
+  s.active = true; s.kind = 2; s.mortar = true;
+  s.sx = t.site.x; s.sy = t.site.y - 8; s.x = s.sx; s.y = s.sy;
+  /* 预判落点 */
+  var pm = G.map.lanes[target.lane] || G.map.lanes[0];
+  var spd = target.baseSpd * (1 - Math.min(0.6, Math.max(target.slowPct, target.mortarSlowPct)));
+  var ahead = pathPoint(pm, Math.min(pm.total, target.prog + spd * 0.45));
+  s.tx = ahead.x; s.ty = ahead.y;
+  var d = Math.hypot(s.tx - s.sx, s.ty - s.sy);
+  s.durMs = Math.max(220, d / 340 * 1000);
+  s.tMs = 0;
+  s.dmg = towerDmg(t); s.pen = towerPen(t); s.splash = towerSplash(t);
+  s.color = t.def.color; s.tower = t;
+  s.slowPct = t.lv >= 2 ? 0.20 : 0;      // Lv3 震爆：−20% 移速 1.0s
+}
+function fireBeam(t, target) {
+  var dmg = towerDmg(t), pen = towerPen(t), secondHit = null;
+  applyDamage(target, dmg, pen, 'D');
+  pBurst(target.x, target.y, 4, t.def.color, 120, 2, 160);
+  /* Lv3 贯穿：弹道延长线 60px 内最近的第 2 个敌人，60% 伤害 */
+  if (t.lv >= 2) {
+    var ang = Math.atan2(target.y - t.site.y, target.x - t.site.x);
+    var dirX = Math.cos(ang), dirY = Math.sin(ang);
+    var second = null, bestD = 1e9, i, e;
+    for (i = 0; i < G.enemies.length; i++) {
+      e = G.enemies[i];
+      if (!e.alive || e === target) continue;
+      if (e.isFlying && !t.def.canHitAir) continue;
+      var rx = e.x - t.site.x, ry = e.y - t.site.y;
+      var along = rx * dirX + ry * dirY;
+      if (along <= 0) continue;
+      var perp = Math.abs(rx * dirY - ry * dirX);
+      if (perp > 12) continue;
+      var gap = along - Math.hypot(target.x - t.site.x, target.y - t.site.y);
+      if (gap < 0 || gap > 60) continue;
+      if (gap < bestD) { bestD = gap; second = e; }
+    }
+    if (second) {
+      /* 与主目标同帧结算（30ms 只是光束表现延迟，绝不延迟伤害） */
+      applyDamage(second, dmg * 0.60, pen, 'D');
+      pBurst(second.x, second.y, 3, t.def.color, 90, 2, 140);
+      secondHit = second;
+    }
+  }
+  /* 视觉：主段 120ms，贯穿段 90ms（延迟 30ms 出现）；光束在首目标处不得中断 */
+  var s = allocShot(); if (!s) return;
+  s.active = true; s.kind = 3;
+  s.x = t.site.x; s.y = t.site.y - 8; s.tx = target.x; s.ty = target.y;
+  s.lifeMs = fxDur(120); s.maxLife = s.lifeMs; s.ageMs = 0;
+  s.has2 = !!secondHit;
+  if (secondHit) { s.tx2 = secondHit.x; s.ty2 = secondHit.y; }
+  s.color = t.def.color;
+}
+
+function updateShots(dtMs) {
+  var i, s, e, j;
+  for (i = 0; i < SHOT_MAX; i++) {
+    s = shots[i];
+    if (!s.active) continue;
+    if (s.kind === 1) {
+      s.lifeMs += dtMs;
+      e = null;
+      for (j = 0; j < G.enemies.length; j++) if (G.enemies[j].eid === s.eid && G.enemies[j].alive) { e = G.enemies[j]; break; }
+      if (e) {
+        var dx = e.x - s.x, dy = e.y - s.y, d = Math.hypot(dx, dy);
+        var step = 1050 * dtMs / 1000;
+        if (d <= step + 6) {
+          applyDamage(e, s.dmg, s.pen, 'A');
+          pBurst(e.x, e.y, 3, C.warn, 80, 2, 140);
+          s.active = false;
+        } else { s.x += dx / d * step; s.y += dy / d * step; }
+      } else s.active = false;
+      if (s.lifeMs > s.maxLife) s.active = false;
+    } else if (s.kind === 2) {
+      s.tMs += dtMs;
+      var t = Math.min(1, s.tMs / s.durMs);
+      s.x = s.sx + (s.tx - s.sx) * t;
+      s.y = s.sy + (s.ty - s.sy) * t - Math.sin(t * Math.PI) * 26;   // 抛物线视觉高度
+      if (t >= 1) {
+        /* 落点溅射：以落点为中心遍历，按距离衰减（GDD 附录 2） */
+        var R = s.splash, i2, e2;
+        for (i2 = 0; i2 < G.enemies.length; i2++) {
+          e2 = G.enemies[i2];
+          if (!e2.alive || e2.isFlying) continue;
+          var dd = Math.hypot(e2.x - s.tx, e2.y - s.ty);
+          if (dd > R) continue;
+          var fall = 1 - (1 - MOD.splashEdge) * (dd / R);
+          applyDamage(e2, s.dmg * fall, s.pen, 'B');
+          if (s.slowPct > 0) { e2.mortarSlowPct = s.slowPct; e2.mortarSlowMs = 1000; }
+        }
+        pBurst(s.tx, s.ty, 8, s.color, 150, 3, 320);
+        pBurst(s.tx, s.ty, 3, C.warn, 80, 2, 220);
+        s.active = false;
+      }
+    } else if (s.kind === 3) {
+      s.ageMs += dtMs;
+      s.lifeMs -= dtMs;
+      if (s.lifeMs <= 0) s.active = false;
+    }
+  }
+}
+function drawShots() {
+  var i, s, e, j;
+  for (i = 0; i < SHOT_MAX; i++) {
+    s = shots[i];
+    if (!s.active) continue;
+    if (s.kind === 1) {
+      ctx.globalCompositeOperation = 'lighter';
+      circle(s.x, s.y, 3.4, s.color);
+      circle(s.x, s.y, 1.6, C.white);
+      ctx.globalCompositeOperation = 'source-over';
+    } else if (s.kind === 2) {
+      circle(s.x, s.y, 4, s.color);
+      ring(s.x, s.y, 5.5, s.color, 1);
+      /* 落点环（表达溅射范围） */
+      ring(s.tx, s.ty, s.splash, s.color, 1);
+      void e; void j;
+    } else if (s.kind === 3) {
+      var a = s.lifeMs / s.maxLife;
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = a;
+      line(s.x, s.y, s.tx, s.ty, s.color, 7);
+      line(s.x, s.y, s.tx, s.ty, C.white, 2);
+      if (s.has2 && s.ageMs >= 30) {       /* 贯穿段：30ms 纯视觉延迟 */
+        ctx.globalAlpha = Math.min(1, s.lifeMs / 90) * 0.55;
+        line(s.tx, s.ty, s.tx2, s.ty2, s.color, 4);
+      }
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+      if (s.has2 && s.ageMs >= 30) {       /* 第 2 目标身上 r6→14 环（120ms） */
+        var k2 = Math.min(1, (s.ageMs - 30) / 120);
+        ctx.globalAlpha = 0.85 * (1 - k2);
+        ring(s.tx2, s.ty2, 6 + k2 * 8, s.color, 2);
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+}
+
+/* ============================================================ 21. 波次系统 */
+function buildQueue(def) {
+  var codes = ['x', 'b', 'd', 'w', 's', 'g'];   // 重型 / Boss 优先插入，避免被步兵淹没
+  var counts = [], maxN = 0, i, k;
+  for (i = 0; i < codes.length; i++) {
+    var n = def[codes[i]] || 0;
+    counts.push(n);
+    if (n > maxN) maxN = n;
+  }
+  var list = [];
+  for (k = 0; k < maxN; k++) {
+    for (i = 0; i < codes.length; i++) if (k < counts[i]) list.push(WAVE_CODE[codes[i]]);
+  }
+  return { list: list, i: 0, tMs: 0, bossHP: def.bossHP || 0 };
+}
+function waveDefForLane(wd, laneIdx, laneCount) {
+  if (wd.A || wd.B) return wd[laneCount > 1 && laneIdx === 1 ? 'B' : 'A'] || null;
+  return laneIdx === 0 ? wd : null;
+}
+function startWave() {
+  if (G.phase !== 'PREP') return;
+  G.wave++;
+  G.phase = 'WAVE';
+  G.queues = [];
+  var wd = WAVES[G.mapId][G.wave - 1];
+  var laneCount = G.map.lanes.length;
+  var li, key, def;
+  for (li = 0; li < laneCount; li++) {
+    key = (li === 0 ? 'A' : 'B');
+    def = waveDefForLane(wd, li, laneCount);
+    G.queues.push(def ? buildQueue(def) : { list: [], i: 0, tMs: 0, bossHP: 0 });
+  }
+  banner('第 ' + G.wave + ' / 12 波');
+  sfx('wave');
+  var hasBoss = (wd.x || 0) > 0 || (wd.A && wd.A.x) || (wd.B && wd.B.x);
+  if (hasBoss) { G.bossFlashMs = fxDur(1600); sfx('boss'); }
+}
+function updateWave(dtMs) {
+  /* 波间倒计时不在这里：它走独立时钟（rawDt 门控），见 updateReal */
+  if (G.phase !== 'WAVE') return;
+  var i, q, gap = WAVE_GAP[Math.min(11, Math.max(0, G.wave - 1))];
+  for (i = 0; i < G.queues.length; i++) {
+    q = G.queues[i];
+    q.tMs -= dtMs;
+    var guard = 0;
+    while (q.tMs <= 0 && q.i < q.list.length && guard < 8) {
+      guard++;
+      var type = q.list[q.i++];
+      spawnEnemy(type, i, { hp: q.bossHP });
+      q.tMs += gap;
+    }
+  }
+  var queued = 0;
+  for (i = 0; i < G.queues.length; i++) queued += (G.queues[i].list.length - G.queues[i].i);
+  if (queued === 0 && G.enemies.length === 0) endWave();
+}
+function endWave() {
+  var def = MAPS[G.mapId];
+  var bonus = def.clearA + def.clearB * G.wave;
+  var interest = 0;
+  if (G.gold >= 100) interest = Math.min(MOD.interestCap, Math.floor(G.gold * MOD.interest));
+  G.gold += bonus + interest;
+  if (MOD.repairPerWave) {
+    var before = G.baseHP;
+    G.baseHP = Math.min(G.baseMax, G.baseHP + MOD.repairPerWave);
+    if (G.baseHP > before) pBurst(G.map.base.x, G.map.base.y, 4, TH.ok, 60, 3, 400);
+  }
+  G.cleared = G.wave;
+  banner('第 ' + G.wave + ' 波清空 · 清波 +' + bonus + (interest > 0 ? ' · 利息 +' + interest : ''));
+  if (G.wave >= 12) { endGame(true); return; }
+  G.phase = 'PREP';
+  G.gapMs = 0;                   // 清波即开始 20s 倒计时
+  G.queues = [];
+}
+/* 剩余整秒数（20s 上限）。奖励 = 剩余整秒 × 2 → 20×2 = 40 恰为上限，
+   全段线性、无「已满」死区，因此不需要 Math.min 之类的 cap 分支 */
+function gapRemainSec() {
+  return Math.max(0, Math.round(GAP_MS / 1000) - Math.floor(G.gapMs / 1000));
+}
+function callNextWave() {
+  if (G.state !== 'PLAY' || G.phase !== 'PREP' || G.paused) return;
+  var bonus = gapRemainSec() * 2;
+  if (bonus > 0) { G.gold += bonus; hint('提前召唤 +' + bonus + ' 金币'); }
+  G.gapMs = GAP_MS;
+  startWave();
+}
+
+/* ============================================================ 22. 建造操作 */
+function hint(msg) { G.hintText = msg; G.hintMs = 1600; }
+function banner(msg) { G.banner.text = msg; G.banner.max = fxDur(1200); G.banner.ms = G.banner.max; }
+
+function buildAtSite(site, type) {
+  if (!site || site.tower) return false;
+  if (site.high && type !== 'A' && type !== 'D') { sfx('error'); hint('高台位仅可建造 A / D'); return false; }
+  var cost = TOWERS[type].cum[0];
+  if (G.gold < cost) { sfx('error'); hint('金币不足（需 ' + cost + '）'); return false; }
+  G.gold -= cost;
+  var t = makeTower(site, type);
+  site.tower = t;
+  G.towers.push(t);
+  pBurst(site.x, site.y, 8, TOWERS[type].color, 90, 3, 320);
+  sfx('build');
+  G.selTower = t; G.selSite = site;
+  return true;
+}
+function upgradeCost(t) {
+  if (t.lv >= 2) return 0;
+  return t.def.lv[t.lv + 1].cost;
+}
+function upgradeTower(t) {
+  if (!t || t.lv >= 2) return false;
+  var cost = upgradeCost(t);
+  if (G.gold < cost) { sfx('error'); hint('金币不足（需 ' + cost + '）'); return false; }
+  G.gold -= cost;
+  t.lv++;
+  t.invested += cost;
+  t.upgradeFx = fxDur(500);
+  pBurst(t.site.x, t.site.y, 6, TH.ok, 80, 3, 380);
+  sfx('upgrade');
+  return true;
+}
+/* 先定到分再取整：invested×0.70 在浮点下得 244.99999999999997，直接 floor 会少 1 金币。
+   规则仍是 floor(累计投入 × 回收率)，此处的 round 只修正浮点表示误差，不改规则。 */
+function sellValue(t) { return Math.floor(Math.round(t.invested * MOD.refund * 100) / 100); }
+function sellTower(t) {
+  if (!t) return false;
+  var v = sellValue(t);
+  G.gold += v;
+  t.site.tower = null;
+  var i = G.towers.indexOf(t);
+  if (i >= 0) { G.towers.splice(i, 1); }
+  if (G.selTower === t) { G.selTower = null; G.selSite = null; }
+  pBurst(t.site.x, t.site.y, 6, C.text2, 70, 3, 280);
+  hint('已出售 +' + v + ' 金币');
+  sfx('sell');
+  return true;
+}
+
+/* ============================================================ 23. 开局/结算 */
+function startGame(mapId) {
+  if (!MAPS[mapId]) return;
+  resetGameState();
+  recomputeTech();
+  G.mapId = mapId;
+  G.map = buildMap(mapId);
+  var def = MAPS[mapId];
+  G.baseMax = def.baseHP + MOD.baseHPAdd;
+  G.baseHP = G.baseMax;
+  G.gold = def.gold;
+  G.wave = 0;
+  G.phase = 'PREP';
+  G.gapMs = 0;
+  G.state = 'PLAY';
+  G.speed = 1; G.paused = false;
+  G.dominantArmor = dominantArmor();
+  UI.focus = -1;
+  bgDirty = true;
+  sfx('click');
+}
+function dominantArmor() {
+  var w = WAVES[G.mapId][Math.min(11, Math.max(0, G.wave))];
+  var acc = {}, total = 0, k, i;
+  function add(def) {
+    if (!def) return;
+    for (k in def) {
+      if (!def.hasOwnProperty(k)) continue;
+      if (k === 'bossHP') continue;
+      var code = WAVE_CODE[k];
+      if (!code) continue;
+      var n = def[k];
+      var arm = ENEMIES[code].arm;
+      acc[arm] = (acc[arm] || 0) + n;
+      total += n;
+    }
+  }
+  add(w);
+  if (w.A || w.B) { add(w.A); add(w.B); }
+  if (!total) return 0;
+  var best = 0, bestN = -1;
+  for (k in acc) if (acc.hasOwnProperty(k)) { if (acc[k] > bestN) { bestN = acc[k]; best = parseInt(k, 10); } }
+  void i;
+  return best;
+}
+function endGame(win) {
+  if (G.phase === 'OVER') return;
+  G.phase = 'OVER';
+  var def = MAPS[G.mapId];
+  var W = Math.min(1, G.cleared / 12);
+  var H = 0.6 + 0.4 * (G.baseHP / Math.max(1, G.baseMax));
+  var base = Math.floor(def.baseTP * W * H);
+  var firstBonus = 0;
+  if (win && !save.firstClear[G.mapId]) firstBonus = 5;
+  var tp = base + firstBonus;
+  save.tp += tp;
+  if (win) save.firstClear[G.mapId] = 1;
+  save.bestWave[G.mapId] = Math.max(save.bestWave[G.mapId] || 0, G.cleared);
+  save.totalKills = (save.totalKills || 0) + G.kills;
+  writeSave();
+  G.result = {
+    win: win, tp: tp, tpBase: base, firstBonus: firstBonus,
+    kills: G.kills, leaks: G.leaks, leaksTotal: G.leaksTotal,
+    timeMs: G.battleMs, cleared: G.cleared
+  };
+  G.state = 'RESULT';
+  sfx(win ? 'win' : 'lose');
+}
+
+/* ============================================================== 24. 聚焦导航 */
+function focusList() {
+  var out = [], i;
+  if (G.state === 'MENU') {
+    for (i = 0; i < 3; i++) out.push('map' + i);
+    out.push('start'); out.push('tech'); out.push('settings');
+  } else if (G.state === 'PLAY') {
+    for (i = 0; i < 4; i++) out.push('card' + i);
+    out.push('next');
+    for (i = 0; i < 3; i++) out.push('spd' + i);
+    out.push('pause'); out.push('set');
+  } else if (G.state === 'RESULT') {
+    out.push('replay'); out.push('totech'); out.push('tomap');
+  } else if (G.state === 'TECH') {
+    for (i = 0; i < TECH_IDS.length; i++) out.push('tech_' + TECH_IDS[i]);
+    out.push('techback'); out.push('techreset'); out.push('settings');
+  }
+  return out;
+}
+function focusIdxInvalid() { UI.focus = -1; }
+function moveFocus(dir) {
+  var list = focusList();
+  if (!list.length) return;
+  if (UI.focus < 0) UI.focus = dir > 0 ? 0 : list.length - 1;
+  else UI.focus = (UI.focus + dir + list.length) % list.length;
+  AUD && initAudio();
+  sfx('click');
+}
+function focusedId() {
+  var list = focusList();
+  if (UI.focus < 0 || UI.focus >= list.length) return null;
+  return list[UI.focus];
+}
+/* 键盘激活焦点项 */
+function activateFocus(id) {
+  var i;
+  if (id.indexOf('map') === 0) {
+    i = parseInt(id.slice(3), 10);
+    if (mapUnlocked(MAP_IDS[i])) { G.mapId = MAP_IDS[i]; sfx('click'); }
+    else { sfx('error'); hint('未解锁：' + unlockText(MAP_IDS[i])); G.hintMs = 2200; }
+    return;
+  }
+  if (id.indexOf('card') === 0) {
+    i = parseInt(id.slice(4), 10);
+    G.buildType = TOWER_IDS[i]; sfx('click');
+    if (G.selSite && !G.selSite.tower) buildAtSite(G.selSite, G.buildType);
+    return;
+  }
+  if (id.indexOf('spd') === 0) {
+    G.speed = parseInt(id.slice(3), 10) + 1; G.paused = false;
+    sfx('click');
+    return;
+  }
+  if (id.indexOf('tech_') === 0) { tryUnlockTech(id.slice(5)); return; }
+  switch (id) {
+    case 'start': startGame(G.mapId); break;
+    case 'tech': G.state = 'TECH'; UI.focus = -1; sfx('click'); break;
+    case 'settings': G.settingsOpen = true; sfx('click'); break;
+    case 'set': G.settingsOpen = true; sfx('click'); break;
+    case 'next': callNextWave(); break;
+    case 'pause': G.paused = !G.paused; sfx('click'); break;
+    case 'replay': startGame(G.mapId); break;
+    case 'totech': G.state = 'TECH'; UI.focus = -1; sfx('click'); break;
+    case 'tomap': G.state = 'MENU'; G.map = null; UI.focus = -1; sfx('click'); break;
+    case 'techback': G.state = 'MENU'; UI.focus = -1; sfx('click'); break;
+    case 'techreset': G.confirmReset = true; sfx('click'); break;
+  }
+}
+/* 返回某 id 的可视矩形（用于焦点环） */
+function focusRect(id) {
+  var i, j;
+  if (G.state === 'MENU') {
+    if (id.indexOf('map') === 0) {
+      i = parseInt(id.slice(3), 10);
+      return { x: MENU_CARD_X[i], y: 210, w: 226, h: 300 };
+    }
+    if (id === 'start') return { x: 64, y: 640, w: 280, h: 56 };
+    if (id === 'tech') return { x: 360, y: 640, w: 200, h: 56 };
+    if (id === 'settings') return { x: 1180, y: 24, w: 76, h: 32 };
+  } else if (G.state === 'PLAY') {
+    if (id.indexOf('card') === 0) {
+      i = parseInt(id.slice(4), 10);
+      return { x: UI.cardX, y: UI.cardY[i], w: UI.cardW, h: UI.cardH };
+    }
+    if (id === 'next') return { x: 16, y: 656, w: 220, h: 48 };
+    if (id.indexOf('sp') === 0) {
+      i = parseInt(id.slice(2), 10);
+      return { x: 720 + i * 52, y: 656, w: 40, h: 40 };
+    }
+    if (id === 'pause') return { x: 1236, y: 20, w: 24, h: 24 };
+  } else if (G.state === 'RESULT') {
+    var btnX = [340, 560, 780];
+    var map = { replay: 0, totech: 1, tomap: 2 };
+    return { x: btnX[map[id]], y: 508, w: 200, h: 48 };
+  } else if (G.state === 'TECH') {
+    if (id.indexOf('tech_') === 0) {
+      var tid = id.slice(5);
+      for (j = 0; j < TECH_IDS.length; j++) if (TECH_IDS[j] === tid) {
+        var pos = techNodePos(j);
+        return { x: pos.x - 26, y: pos.y - 26, w: 52, h: 52 };
+      }
+    }
+    if (id === 'techback') return { x: 64, y: 656, w: 200, h: 44 };
+    if (id === 'techreset') return { x: 1016, y: 656, w: 200, h: 44 };
+    if (id === 'settings') return { x: 1180, y: 24, w: 76, h: 32 };
+  }
+  return null;
+}
+
+/* ================================================================ 25. 输入 */
+var mouse = { x: -999, y: -999, down: false, inside: false };
+function hitRect(p, r) { return r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+
+function onPointerMove(x, y) {
+  mouse.x = x; mouse.y = y; mouse.inside = true;
+  if (G.state === 'PLAY') {
+    var s = siteTowerAt(G.map, x, y);
+    G.hoverSite = s;
+    canvas.className = (s || hitRect(mouse, UI.nextRect) ) ? 'ptr' : '';
+  }
+}
+function onPointerDown(x, y) {
+  initAudio();
+  mouse.x = x; mouse.y = y;
+  if (G.settingsOpen) { settingsClick(x, y); return; }
+  if (G.state === 'MENU') menuClick(x, y);
+  else if (G.state === 'PLAY') playClick(x, y);
+  else if (G.state === 'RESULT') resultClick(x, y);
+  else if (G.state === 'TECH') techClick(x, y);
+}
+function playClick(x, y) {
+  var i;
+  /* 顶栏：倍速三档 / 暂停 / 设置 */
+  for (i = 0; i < 3; i++) {
+    if (hitRect(mouse, UI.speedRects[i])) { G.speed = i + 1; G.paused = false; sfx('click'); return; }
+  }
+  if (hitRect(mouse, UI.pauseRect)) { G.paused = !G.paused; sfx('click'); return; }
+  if (hitRect(mouse, UI.setRect)) { G.settingsOpen = true; sfx('click'); return; }
+  /* 建造栏卡片 */
+  for (i = 0; i < 4; i++) {
+    if (hitRect(mouse, { x: UI.cardX, y: UI.cardY[i], w: UI.cardW, h: UI.cardH })) {
+      G.buildType = TOWER_IDS[i];
+      sfx('click');
+      if (G.selSite && !G.selSite.tower) buildAtSite(G.selSite, TOWER_IDS[i]);
+      return;
+    }
+  }
+  /* 选中塔详情：升级 / 出售 */
+  if (G.selTower) {
+    var p = UI.towerPanel;
+    if (hitRect(mouse, { x: p.x + 12, y: p.y + 78, w: 148, h: 34 })) { upgradeTower(G.selTower); return; }
+    if (hitRect(mouse, { x: p.x + 168, y: p.y + 78, w: 96, h: 34 })) { sellTower(G.selTower); return; }
+  }
+  /* 提前召唤（底栏右） */
+  if (hitRect(mouse, UI.nextRect)) { callNextWave(); return; }
+  /* 战场：选点位 / 选塔 */
+  if (x >= FIELD_X && x <= FIELD_X + FIELD_W && y >= FIELD_Y && y <= FIELD_Y + FIELD_H) {
+    var st = siteTowerAt(G.map, x, y);
+    if (st) {
+      if (st.tower) { G.selTower = st.tower; G.selSite = st; sfx('click'); }
+      else {
+        G.selSite = st; G.selTower = null;
+        buildAtSite(st, G.buildType);
+      }
+    } else { G.selSite = null; G.selTower = null; }
+    return;
+  }
+  G.selSite = null; G.selTower = null;
+}
+function menuClick(x, y) {
+  var i;
+  if (x >= 1180 && x <= 1256 && y >= 24 && y <= 56) { G.settingsOpen = true; sfx('click'); return; }
+  for (i = 0; i < 3; i++) {
+    if (x >= MENU_CARD_X[i] && x <= MENU_CARD_X[i] + 226 && y >= 210 && y <= 510) {
+      if (mapUnlocked(MAP_IDS[i])) { G.mapId = MAP_IDS[i]; sfx('click'); }
+      else { sfx('error'); hint('未解锁：' + unlockText(MAP_IDS[i])); G.hintMs = 2200; }
+      return;
+    }
+  }
+  if (x >= 64 && x <= 344 && y >= 640 && y <= 696) { startGame(G.mapId); return; }
+  if (x >= 360 && x <= 560 && y >= 640 && y <= 696) { G.state = 'TECH'; UI.focus = -1; sfx('click'); return; }
+}
+function resultClick(x, y) {
+  if (y >= 508 && y <= 556) {
+    if (x >= 340 && x <= 540) { startGame(G.mapId); return; }
+    if (x >= 560 && x <= 760) { G.state = 'TECH'; UI.focus = -1; sfx('click'); return; }
+    if (x >= 780 && x <= 980) { G.state = 'MENU'; G.map = null; UI.focus = -1; sfx('click'); return; }
+  }
+}
+function techClick(x, y) {
+  var i, pos;
+  if (G.settingsOpen) { settingsClick(x, y); return; }
+  if (x >= 1180 && x <= 1256 && y >= 24 && y <= 56) { G.settingsOpen = true; sfx('click'); return; }
+  if (x >= 64 && x <= 264 && y >= 656 && y <= 700) { G.state = 'MENU'; UI.focus = -1; sfx('click'); return; }
+  if (x >= 1016 && x <= 1216 && y >= 656 && y <= 700) { G.confirmReset = true; sfx('click'); return; }
+  if (G.confirmReset) {
+    if (x >= 500 && x <= 700 && y >= 400 && y <= 448) { resetSave(); applySettings(); G.confirmReset = false; hint('存档已重置'); return; }
+    if (x >= 720 && x <= 880 && y >= 400 && y <= 448) { G.confirmReset = false; return; }
+    return;
+  }
+  for (i = 0; i < TECH_IDS.length; i++) {
+    pos = techNodePos(i);
+    if (Math.hypot(x - pos.x, y - pos.y) <= 26) { tryUnlockTech(TECH_IDS[i]); return; }
+  }
+}
+function tryUnlockTech(id) {
+  var t = TECH[id];
+  if (save.tech[id]) { sfx('error'); hint('该节点已点亮'); return; }
+  if (t.pre && !save.tech[t.pre]) { sfx('error'); hint('需先点亮：' + TECH[t.pre].name); return; }
+  if (save.tp < t.cost) { sfx('error'); hint('科技点不足（需 ' + t.cost + '）'); return; }
+  save.tp -= t.cost;
+  save.tech[id] = 1;
+  recomputeTech();
+  writeSave();
+  sfx('tech');
+  hint('已点亮：' + t.name);
+}
+
+/* 键盘 */
+window.addEventListener('keydown', function (e) {
+  initAudio();
+  var k = e.key;
+  if (G.settingsOpen) {
+    if (k === 'Escape') { G.settingsOpen = false; e.preventDefault(); }
+    return;
+  }
+  if (k === 'Tab') {
+    moveFocus(e.shiftKey ? -1 : 1);
+    e.preventDefault();
+    return;
+  }
+  if (k === 'Enter') {
+    var id = focusedId();
+    if (id) { activateFocus(id); e.preventDefault(); }
+    return;
+  }
+  if (G.state === 'PLAY') {
+    if (k === ' ' || k === 'Spacebar') { callNextWave(); e.preventDefault(); return; }
+    if (k === 'Escape') { G.selSite = null; G.selTower = null; sfx('click'); return; }
+    if (k >= '1' && k <= '4') {
+      var idx = parseInt(k, 10) - 1;
+      G.buildType = TOWER_IDS[idx];
+      sfx('click');
+      if (G.selSite && !G.selSite.tower) buildAtSite(G.selSite, G.buildType);
+      return;
+    }
+    if (k === 'p' || k === 'P') { G.paused = !G.paused; return; }
+    if (k === ']') { G.speed = Math.min(3, G.speed + 1); G.paused = false; sfx('click'); return; }
+    if (k === '[') { G.speed = Math.max(1, G.speed - 1); G.paused = false; sfx('click'); return; }
+  } else if (G.state === 'TECH') {
+    if (k === 'Escape') { G.state = 'MENU'; UI.focus = -1; return; }
+  } else if (G.state === 'MENU') {
+    if (k === 'Enter') { startGame(G.mapId); return; }
+    if (k === 'ArrowLeft' || k === 'ArrowRight') {
+      var cur = MAP_IDS.indexOf(G.mapId);
+      cur = (cur + (k === 'ArrowRight' ? 1 : 2)) % 3;
+      if (mapUnlocked(MAP_IDS[cur])) G.mapId = MAP_IDS[cur];
+      sfx('click');
+      return;
+    }
+  } else if (G.state === 'RESULT') {
+    if (k === 'Escape') { G.state = 'MENU'; return; }
+  }
+});
+/* 鼠标（含触屏） */
+canvas.addEventListener('mousemove', function (e) { var p = toLogic(e.clientX, e.clientY); onPointerMove(p.x, p.y); });
+canvas.addEventListener('mouseleave', function () { mouse.inside = false; mouse.x = -999; mouse.y = -999; if (G.state === 'PLAY') G.hoverSite = null; });
+canvas.addEventListener('mousedown', function (e) { if (e.button !== 0) return; var p = toLogic(e.clientX, e.clientY); mouse.down = true; onPointerDown(p.x, p.y); });
+canvas.addEventListener('mouseup', function () { mouse.down = false; });
+canvas.addEventListener('touchstart', function (e) {
+  if (!e.touches.length) return;
+  var t = e.touches[0], p = toLogic(t.clientX, t.clientY);
+  onPointerMove(p.x, p.y); onPointerDown(p.x, p.y);
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener('touchmove', function (e) {
+  if (!e.touches.length) return;
+  var t = e.touches[0], p = toLogic(t.clientX, t.clientY);
+  onPointerMove(p.x, p.y);
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+/* =============================================================== 26. 布局常量
+   art-bible §5.1 的坐标表集中于此：绘制处一律读 L.xxx / u(...)，不写字面量。
+   A4「UI 缩放」= 改本表系数，不改画布分辨率；战场栅格 CELL=40 恒不缩放。
+   几何系数上限 1.05：1280×720 固定画布下 4 张卡 + 底栏已排满，1.5× 几何会溢出；
+   文字走 fs()（可到 1.5×）。这是刻意的 clamp，不是遗漏。 */
+var L = {
+  topH: 64, fieldX: 0, fieldY: 64, fieldW: 1000, fieldH: 576,
+  bottomY: 640, bottomH: 80,
+  panelX: 1000, panelY: 64, panelW: 280, panelH: 656,
+  cardX: 1012, cardW: 256, cardH: 112, cardStep: 124, cardY0: 80,
+  detail: { x: 1012, y: 580, w: 256, h: 124 },
+  preview: { x: 16, y: 656, w: 752, h: 48 },
+  next: { x: 784, y: 656, w: 200, h: 48 },
+  speedX: [1064, 1104, 1144], speedY: 20, speedW: 36, speedH: 24,
+  pause: { x: 1204, y: 20, w: 24, h: 24 },
+  set: { x: 1244, y: 20, w: 24, h: 24 }
+};
+var MENU_CARD_X = [536, 782, 1028];
+UI.focus = -1;
+function u(v) { return Math.round(v * Math.min(UI.uiScale, 1.05)); }
+function layoutHUD() {
+  var k = Math.min(UI.uiScale, 1.05);
+  UI.cardY = [];
+  for (var i = 0; i < 4; i++) UI.cardY[i] = L.cardY0 + Math.round(L.cardStep * k * i);
+  UI.cardX = L.cardX; UI.cardW = L.cardW; UI.cardH = Math.round(L.cardH * k);
+  UI.previewRect = { x: L.preview.x, y: L.preview.y, w: L.preview.w, h: L.preview.h };
+  UI.nextRect = { x: L.next.x, y: L.next.y, w: L.next.w, h: L.next.h };
+  UI.towerPanel = { x: L.detail.x, y: L.detail.y, w: L.detail.w, h: L.detail.h };
+  UI.speedRects = [];
+  for (var j = 0; j < 3; j++) {
+    UI.speedRects.push({ x: L.speedX[j], y: L.speedY, w: L.speedW, h: L.speedH });
+  }
+  UI.pauseRect = { x: L.pause.x, y: L.pause.y, w: L.pause.w, h: L.pause.h };
+  UI.setRect = { x: L.set.x, y: L.set.y, w: L.set.w, h: L.set.h };
+}
+layoutHUD();
+
+function mapUnlocked(id) {
+  if (id === 'M1') return true;
+  if (id === 'M2') return !!save.firstClear.M1;
+  if (id === 'M3') return !!save.firstClear.M2;
+  return false;
+}
+function unlockText(id) {
+  if (id === 'M2') return '通关 M1 峡谷关隘';
+  if (id === 'M3') return '通关 M2 双流枢纽';
+  return '';
+}
+/* 科技树节点坐标（art-bible §5.4）：F2/F3、E2/E3 是 Y 形平级分叉，禁止三点链式竖排；
+   D1→D2 无分叉，直连竖线。前置关系必须由「几何」表达，否则玩家会以为 F3 需要 F2。 */
+var TECH_POS = {
+  F1: { x: 260, y: 240 }, F2: { x: 192, y: 348 }, F3: { x: 328, y: 348 },
+  E1: { x: 640, y: 240 }, E2: { x: 572, y: 348 }, E3: { x: 708, y: 348 },
+  D1: { x: 1020, y: 240 }, D2: { x: 1020, y: 348 }
+};
+var TECH_COL = { F: 260, E: 640, D: 1020 };
+function techNodePos(i) {
+  var p = TECH_POS[TECH_IDS[i]];
+  return { x: p.x, y: p.y };
+}
+/* 父→子连线：父节点底垂直下 24px → 水平折至子节点 x → 垂直下至子节点顶（只允许直角段） */
+function techLink(parentId, childId, lit) {
+  var a = TECH_POS[parentId], b = TECH_POS[childId];
+  var y0 = a.y + 26, y1 = a.y + 26 + 24, y2 = b.y - 26;
+  ctx.strokeStyle = lit ? TH.accent : C.grid;
+  ctx.lineWidth = 2;
+  ctx.save();
+  if (!lit) ctx.setLineDash([6, 6]);
+  ctx.beginPath();
+  ctx.moveTo(a.x + 0.5, y0);
+  if (a.x === b.x) {
+    ctx.lineTo(b.x + 0.5, y2);
+  } else {
+    ctx.lineTo(a.x + 0.5, y1);
+    ctx.lineTo(b.x + 0.5, y1);
+    ctx.lineTo(b.x + 0.5, y2);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* ======================================================= 27. 静态背景预渲染 */
+var bgCanvas = null, bgx = null, bgDirty = true;
+function withCtx(c, fn) { var old = ctx; ctx = c; fn(); ctx = old; }
+
+function drawPathPolyline(g, pts, width, col, joinRound) {
+  g.strokeStyle = col;
+  g.lineWidth = width;
+  g.lineJoin = joinRound === false ? 'miter' : 'round';
+  g.lineCap = joinRound === false ? 'butt' : 'round';
+  g.beginPath();
+  /* pts 既可能是 [x,y] 数组，也可能是 {x,y} 对象，两种都兼容 */
+  var p0 = pts[0];
+  g.moveTo(px(p0), py(p0));
+  for (var i = 1; i < pts.length; i++) g.lineTo(px(pts[i]), py(pts[i]));
+  g.stroke();
+}
+function px(p) { return p.length !== undefined ? p[0] : p.x; }
+function py(p) { return p.length !== undefined ? p[1] : p.y; }
+
+function renderStatic() {
+  if (!bgCanvas) {
+    bgCanvas = document.createElement('canvas');
+    bgCanvas.width = LW; bgCanvas.height = LH;
+    bgx = bgCanvas.getContext('2d');
+  }
+  withCtx(bgx, function () {
+    ctx.clearRect(0, 0, LW, LH);
+    /* 底 */
+    fillRect(0, 0, LW, LH, C.bg);
+
+    /* 战场底 */
+    fillRect(FIELD_X, FIELD_Y, FIELD_W, FIELD_H, C.ground);
+
+    /* 栅格 */
+    var i;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(FIELD_X, FIELD_Y, FIELD_W, FIELD_H); ctx.clip();
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    for (i = 0; i <= GRID_COLS; i++) { var gx = GRID_OX + i * CELL + 0.5; ctx.moveTo(gx, FIELD_Y); ctx.lineTo(gx, FIELD_Y + FIELD_H); }
+    for (i = 0; i <= GRID_ROWS; i++) { var gy = GRID_OY + i * CELL + 0.5; ctx.moveTo(FIELD_X, gy); ctx.lineTo(FIELD_X + FIELD_W, gy); }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    /* 地面反光斜条（低透明度渐变斜条，不使用模糊） */
+    if (G.map) {
+      var se;
+      ctx.globalAlpha = 0.028;
+      ctx.strokeStyle = C.accent;
+      ctx.lineWidth = 26;
+      ctx.beginPath();
+      for (se = -600; se < 1600; se += 130) { ctx.moveTo(se, FIELD_Y + FIELD_H); ctx.lineTo(se + 420, FIELD_Y); }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      /* 路径：先压暗边，再铺亮路面，最后打一条中心虚线（靠亮度而非颜色区分） */
+      var L;
+      for (i = 0; i < G.map.lanes.length; i++) {
+        L = G.map.lanes[i];
+        drawPathPolyline(ctx, L.pts, PATH_W + 10, C.pathEdge);
+        drawPathPolyline(ctx, L.pts, PATH_W, C.pathBase);
+        drawPathPolyline(ctx, L.pts, PATH_W - 4, C.pathTop);
+        ctx.globalAlpha = 0.55;
+        ctx.save();
+        ctx.setLineDash([10, 12]);
+        drawPathPolyline(ctx, L.pts, 1, C.pathLine);
+        ctx.restore();
+        ctx.globalAlpha = 1;
+      }
+
+      /* 盲区警示斜纹（沿路径宽度绘制） */
+      if (G.map.blind.length && hatchPattern) {
+        for (i = 0; i < G.map.blind.length; i++) {
+          var run = G.map.blind[i];
+          var pm = G.map.lanes[run.lane];
+          var poly = [], d;
+          for (d = run.s; d <= run.e; d += 8) { var pp = pathPoint(pm, d); poly.push({ x: pp.x, y: pp.y }); }
+          var pe = pathPoint(pm, run.e); poly.push({ x: pe.x, y: pe.y });
+          ctx.save();
+          ctx.strokeStyle = hatchPattern;
+          ctx.lineWidth = PATH_W;
+          ctx.lineJoin = 'round'; ctx.lineCap = 'butt';
+          ctx.beginPath();
+          ctx.moveTo(poly[0].x, poly[0].y);
+          for (var q = 1; q < poly.length; q++) ctx.lineTo(poly[q].x, poly[q].y);
+          ctx.stroke();
+          ctx.restore();
+          /* 段两端各一道 12px 横向短刻度（辅助线索，α0.50） */
+          var ends = [pathPoint(pm, run.s), pathPoint(pm, run.e)];
+          ctx.globalAlpha = 0.5;
+          for (var ei = 0; ei < 2; ei++) {
+            var ev = ends[ei], per = ev.a + Math.PI / 2;
+            line(ev.x - Math.cos(per) * 6, ev.y - Math.sin(per) * 6,
+              ev.x + Math.cos(per) * 6, ev.y + Math.sin(per) * 6, TH.warn, 2);
+          }
+          ctx.globalAlpha = 1;
+          /* 段中点上方常驻三角警告 + 感叹号（不呼吸，避免动效疲劳） */
+          var mid = pathPoint(pm, (run.s + run.e) / 2);
+          ctx.globalAlpha = 0.82;
+          fillRect(mid.x - 54, mid.y - 6, 108, 18, C.bg);
+          ctx.globalAlpha = 1;
+          ctx.globalAlpha = 0.35;
+          polyPath(mid.x, mid.y - 26, 8, 3, -Math.PI / 2);
+          ctx.fillStyle = TH.warn; ctx.fill();
+          ctx.globalAlpha = 1;
+          text('!', mid.x, mid.y - 21, 12, C.text, 'center', 700);
+          text('盲区 · 无火力覆盖', mid.x, mid.y + 4, 12, TH.warn, 'center', 600);
+        }
+      }
+    }
+    ctx.restore();
+
+    /* 战场外框 */
+    strokeRect(FIELD_X, FIELD_Y, FIELD_W, FIELD_H, C.grid, 2);
+
+    /* 顶栏 */
+    fillRect(0, 0, LW, 64, C.topbar);
+    fillRect(0, 62, LW, 2, C.grid);
+    /* 底栏 */
+    fillRect(0, BOTTOM_Y, FIELD_W, BOTTOM_H, C.topbar);
+    fillRect(0, BOTTOM_Y, FIELD_W, 2, C.grid);
+    /* 右栏 */
+    fillRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, C.panel);
+    fillRect(PANEL_X, PANEL_Y, 2, PANEL_H, C.grid);
+
+    /* 静态文案：顶栏标签 */
+    text('基地', 44, 38, 12, C.text2, 'left', 600);
+    text('金币', 204, 38, 12, C.text2, 'left', 600);
+    /* 静态文案：建造栏 */
+    text('建造', 1012, 62, 20, C.text, 'left', 600);
+    text('科技加成', 1256, 62, 12, C.text2, 'right', 400);
+    var i2;
+    for (i2 = 0; i2 < 4; i2++) {
+      var cdef = TOWERS[TOWER_IDS[i2]];
+      var cy = UI.cardY[i2], ch = UI.cardH;
+      fillRect(UI.cardX, cy, UI.cardW, ch, rgba(C.ground, 0.55));
+      strokeRect(UI.cardX, cy, UI.cardW, ch, C.grid, 2);
+      /* 缩略 36×36（塔的身份靠底座边数 4/6/8/3，灰度可辨） */
+      drawTowerIcon(cdef, 1042, cy + 26, 1.0, 0);
+      text('[' + (i2 + 1) + ']', 1256, cy + 20, 12, C.text2, 'right', 600, true);
+      text(cdef.name, 1068, cy + 26, 14, cdef.color, 'left', 600);
+      text(cdef.tag, 1024, cy + 92, 12, C.text2, 'left', 400);
+      /* B 塔「不可对空」角标：10×10 下压箭头 + 短横线，不依赖颜色 */
+      if (!cdef.canHitAir) {
+        ctx.strokeStyle = TH.warn; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(1246, cy + 16); ctx.lineTo(1246, cy + 22);
+        ctx.moveTo(1242, cy + 19); ctx.lineTo(1246, cy + 23); ctx.lineTo(1250, cy + 19);
+        ctx.moveTo(1242, cy + 26); ctx.lineTo(1250, cy + 26);
+        ctx.stroke();
+      }
+    }
+    /* 详情面板框 */
+    fillRect(UI.towerPanel.x, UI.towerPanel.y, UI.towerPanel.w, UI.towerPanel.h, rgba(C.ground, 0.55));
+    strokeRect(UI.towerPanel.x, UI.towerPanel.y, UI.towerPanel.w, UI.towerPanel.h, C.grid, 2);
+  });
+  bgDirty = false;
+}
+
+/* 塔型缩略图（建造栏 / 科技树共用） */
+function drawTowerIcon(def, cx, cy, scale, angle) {
+  var s = scale || 1;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(s, s);
+  var col = def.color;
+  if (def.id === 'A') {
+    fillRect(-15, -15, 30, 30, C.path);
+    strokeRect(-15, -15, 30, 30, col, 2);
+    circle(0, 0, 9, col); circle(0, 0, 5, C.bg);
+    ctx.save(); ctx.rotate(angle || 0);
+    fillRect(0, -3, 18, 6, col);
+    ctx.restore();
+  } else if (def.id === 'B') {
+    polyPath(0, 0, 17, 6, Math.PI / 6);
+    ctx.fillStyle = C.path; ctx.fill();
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+    circle(0, 0, 7, col);
+    for (var i = 0; i < 3; i++) {
+      var a = -Math.PI / 2 + i * TAU / 3;
+      circle(Math.cos(a) * 11, Math.sin(a) * 11, 4, col);
+    }
+  } else if (def.id === 'C') {
+    polyPath(0, 0, 16, 8, Math.PI / 8);
+    ctx.fillStyle = C.path; ctx.fill();
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+    ring(0, 0, 10, col, 2); ring(0, 0, 6, col, 2);
+    fillRect(-1.5, -1.5, 3, 3, C.text);
+  } else {
+    polyPath(0, 0, 18, 3, -Math.PI / 2);
+    ctx.fillStyle = C.path; ctx.fill();
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+    fillRect(-2, -10, 4, 20, col);
+    ctx.beginPath();
+    ctx.moveTo(0, -14); ctx.lineTo(4, -8); ctx.lineTo(-4, -8); ctx.closePath();
+    ctx.fillStyle = col; ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* ========================================================= 28. 局内绘制：实体 */
+function drawBase() {
+  var b = G.map.base;
+  var frac = Math.max(0, G.baseHP / Math.max(1, G.baseMax));
+  var col = frac <= 0.25 ? TH.danger : (frac <= 0.5 ? TH.warn : TH.accent);
+  /* 底座 100×100 */
+  fillRect(b.x - 50, b.y - 50, 100, 100, C.path);
+  strokeRect(b.x - 50, b.y - 50, 100, 100, TH.accent, 3);
+  /* 四角 L 形装饰 */
+  var corners = [[-50, -50, 1, 1], [50, -50, -1, 1], [-50, 50, 1, -1], [50, 50, -1, -1]];
+  for (var i = 0; i < 4; i++) {
+    var c = corners[i];
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(b.x + c[0], b.y + c[1] + 14 * c[3]);
+    ctx.lineTo(b.x + c[0], b.y + c[1]);
+    ctx.lineTo(b.x + c[0] + 14 * c[2], b.y + c[1]);
+    ctx.stroke();
+  }
+  /* 内层正八边形 */
+  polyPath(b.x, b.y, 32, 8, Math.PI / 8);
+  ctx.fillStyle = C.ground; ctx.fill();
+  ctx.strokeStyle = TH.accent; ctx.lineWidth = 1.5; ctx.stroke();
+  /* 中心圆 */
+  circle(b.x, b.y, 12, col);
+  /* 血量环 R=40 */
+  ctx.strokeStyle = rgba(C.grid, 0.9); ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(b.x, b.y, 40, 0, TAU); ctx.stroke();
+  arcRing(b.x, b.y, 40, -Math.PI / 2, -Math.PI / 2 + TAU * frac, col, 3);
+  /* 受损焦痕：每降 10% 一处，上限 8 */
+  var marks = Math.min(8, Math.floor((1 - frac) * 10));
+  for (var k = 0; k < marks; k++) {
+    var a = (k * 2.399) % TAU, rr = 34 + (k % 3) * 6;
+    ctx.globalAlpha = 0.85;
+    fillRect(b.x + Math.cos(a) * rr - 2, b.y + Math.sin(a) * rr - 2, 4, 4, C.bg);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawSites(dtMs) {
+  var i, s, affordable, col;
+  var rngPreview = 0;
+  for (i = 0; i < G.map.sites.length; i++) {
+    s = G.map.sites[i];
+    if (s.tower) continue;
+    affordable = G.gold >= TOWERS[G.buildType].cum[0];
+    var isHover = (G.hoverSite === s || G.selSite === s);
+    if (!affordable) {
+      ring(s.x, s.y, 14, C.locked, 1.5);
+      disabledCross(s.x, s.y, 14, C.locked);
+    } else {
+      ring(s.x, s.y, 14, TH.ok, 2);
+      /* 4 段 6px 短弧，周期 2400ms */
+      var rot = (G.battleMs % 2400) / 2400 * TAU;
+      for (var k = 0; k < 4; k++) {
+        var a0 = rot + k * TAU / 4;
+        arcRing(s.x, s.y, 17, a0, a0 + 0.16, TH.ok, 2);
+      }
+    }
+    if (s.high) {
+      /* 高台标记：小三角 + "高" */
+      ctx.globalAlpha = 0.9;
+      polyPath(s.x, s.y - 22, 5, 3, -Math.PI / 2);
+      ctx.fillStyle = TH.warn; ctx.fill();
+      ctx.globalAlpha = 1;
+      text('高', s.x, s.y + 26, 12, TH.warn, 'center', 600);
+    }
+    if (isHover) {
+      ring(s.x, s.y, 17, TH.accent, 3);
+      focusBrackets(s.x - 17, s.y - 17, 34, 34, TH.accent);
+      ctx.globalAlpha = 0.12;
+      circle(s.x, s.y, 19, TH.accent);
+      ctx.globalAlpha = 1;
+      rngPreview = TOWERS[G.buildType].lv[0].rng * (s.high ? 1.15 : 1);
+      if (rngPreview > 0) {
+        ctx.globalAlpha = 0.10;
+        circle(s.x, s.y, rngPreview, TOWERS[G.buildType].color);
+        ctx.globalAlpha = 1;
+        ring(s.x, s.y, rngPreview, TOWERS[G.buildType].color, 1.5);
+      }
+    }
+  }
+}
+function drawRangeCircles() {
+  var i, t;
+  /* 仅在悬停/选中时强调；其余塔只画极弱描边，避免 14+ 圆圈互相干扰 */
+  for (i = 0; i < G.towers.length; i++) {
+    t = G.towers[i];
+    if (t === G.selTower) continue;
+    var r = towerRng(t);
+    if (G.selTower && Math.hypot(t.site.x - G.selTower.site.x, t.site.y - G.selTower.site.y) > r + towerRng(G.selTower)) continue;
+    ctx.globalAlpha = t.def.kind === 'aura' ? 0.16 : 0.10;
+    ring(t.site.x, t.site.y, r, t.def.color, 1);
+    ctx.globalAlpha = 1;
+  }
+  if (G.selTower) {
+    var st = G.selTower, sr = towerRng(st);
+    ctx.globalAlpha = 0.055;
+    circle(st.site.x, st.site.y, sr, st.def.color);
+    ctx.globalAlpha = 0.85;
+    ring(st.site.x, st.site.y, sr, st.def.color, 2);
+    ctx.globalAlpha = 1;
+  }
+}
+function drawTowers(dtMs) {
+  var i, t, s;
+  for (i = 0; i < G.towers.length; i++) {
+    t = G.towers[i];
+    s = t.site;
+    var sc = 1;
+    if (t.upgradeFx > 0) {
+      var k = 1 - t.upgradeFx / fxDur(500);
+      sc = 1 + Math.sin(k * Math.PI) * 0.18;
+    }
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.scale(sc, sc);
+    var col = t.def.color;
+    if (t.type === 'A') {
+      fillRect(-15, -15, 30, 30, C.path);
+      strokeRect(-15, -15, 30, 30, col, 2);
+      circle(0, 0, 9, col); circle(0, 0, 5, C.bg);
+      ctx.save(); ctx.rotate(t.angle);
+      fillRect(4, -3, 14, 6, col);
+      if (t.flash > 0) fillRect(16, -4, 12, 8, C.white);
+      ctx.restore();
+    } else if (t.type === 'B') {
+      polyPath(0, 0, 17, 6, Math.PI / 6);
+      ctx.fillStyle = C.path; ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+      circle(0, 0, 7, col);
+      for (var k2 = 0; k2 < 3; k2++) {
+        var a = -Math.PI / 2 + k2 * TAU / 3;
+        circle(Math.cos(a) * 11, Math.sin(a) * 11, 4, col);
+        circle(Math.cos(a) * 11, Math.sin(a) * 11, 1.6, C.bg);
+      }
+      if (t.flash > 0) { ctx.globalAlpha = 0.5; circle(0, 0, 13, C.white); ctx.globalAlpha = 1; }
+    } else if (t.type === 'C') {
+      polyPath(0, 0, 16, 8, Math.PI / 8);
+      ctx.fillStyle = C.path; ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+      ring(0, 0, 10, col, 2); ring(0, 0, 6, col, 2);
+      fillRect(-1.5, -1.5, 3, 3, C.text);
+      /* 自转装饰弧 */
+      for (var k3 = 0; k3 < 3; k3++) {
+        var a3 = t.spin + k3 * TAU / 3;
+        arcRing(0, 0, 12.5, a3, a3 + 0.5, col, 1.5);
+      }
+    } else {
+      polyPath(0, 0, 18, 3, -Math.PI / 2);
+      ctx.fillStyle = C.path; ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+      ctx.save(); ctx.rotate(t.angle + Math.PI / 2);
+      fillRect(-2, -13, 4, 20, col);
+      ctx.beginPath(); ctx.moveTo(0, -17); ctx.lineTo(4, -11); ctx.lineTo(-4, -11); ctx.closePath();
+      ctx.fillStyle = col; ctx.fill();
+      if (t.flash > 0) circle(0, -14, 4, C.white);
+      ctx.restore();
+    }
+    /* 等级点 */
+    for (var lv = 0; lv <= t.lv; lv++) circle(-9 + lv * 9, 22, 2, lv === 2 ? TH.warn : C.text);
+    ctx.restore();
+    /* 选中态 */
+    if (G.selTower === t) {
+      ring(s.x, s.y, 20, TH.accent, 3);
+      focusBrackets(s.x - 18, s.y - 18, 36, 36, TH.accent);
+    }
+  }
+}
+
+function drawEnemy(e) {
+  var x = e.x, y = e.y, col = e.def.color;
+  var bob = 0;
+  if (e.type === 'GRUNT') bob = Math.sin(e.tMs / 160) * 1;
+  if (e.isFlying) {
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = C.black;
+    ctx.beginPath();
+    ctx.ellipse(x, y + 20, 10, 4, 0, 0, TAU);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    y += Math.sin(e.tMs / 240) * 2;
+  }
+  var edge = e.isBoss ? TH.danger : rgba(C.edge, 0.5);
+  var edgeW = e.isBoss ? 2 : 1.5;
+
+  if (e.hitFlash > 0) col = C.white;
+
+  if (e.def.shape === 'tri') {
+    polyPath(x, y + bob, 9, 3, e.a + Math.PI / 2);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = edge; ctx.lineWidth = edgeW; ctx.stroke();
+    circle(x, y + bob, 2, C.white);
+  } else if (e.def.shape === 'diamond') {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(e.a);
+    ctx.beginPath();
+    ctx.moveTo(9, 0); ctx.lineTo(0, 5); ctx.lineTo(-9, 0); ctx.lineTo(0, -5); ctx.closePath();
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = edge; ctx.lineWidth = edgeW; ctx.stroke();
+    ctx.globalAlpha = 0.35;
+    line(-9, 0, -17, 0, col, 3);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  } else if (e.def.shape === 'rect') {
+    ctx.save();
+    ctx.translate(x, y);
+    roundRectPath(-5.5, -5.5, 11, 11, 3);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = edge; ctx.lineWidth = edgeW; ctx.stroke();
+    fillRect(-2, -4, 4, 8, TH.warn);
+    ctx.restore();
+  } else if (e.def.shape === 'vwing') {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(e.a + Math.PI / 2);
+    ctx.beginPath();
+    ctx.moveTo(0, -6); ctx.lineTo(-8, 6); ctx.lineTo(0, 2); ctx.lineTo(8, 6); ctx.closePath();
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = edge; ctx.lineWidth = 1; ctx.stroke();
+    if (!UI.reducedMotion) ctx.setLineDash([]);
+    circle(0, 0, 2.5, C.white);
+    ctx.restore();
+  } else if (e.def.shape === 'hex') {
+    polyPath(x, y, 15, 6, Math.PI / 6);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = edge; ctx.lineWidth = edgeW; ctx.stroke();
+    line(x - 6, y, x + 6, y, C.bg, 2);
+    line(x, y - 6, x, y + 6, C.bg, 2);
+    /* 护盾光环：1.5px wardenAura @α0.55 虚线（dash 8/6），中心留空 r20→90
+       虚线是刻意的：与玩家射程圈（实线）形状区分，避免误读为友方建筑 */
+    if (e.def.auraR) {
+      var aur = e.def.auraR;
+      ctx.globalAlpha = 0.55;
+      ctx.save(); ctx.setLineDash([8, 6]);
+      ctx.strokeStyle = C.wardenAura; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, aur, 0, TAU); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x, y, 20, 0, TAU); ctx.stroke();
+      ctx.restore();
+      ctx.globalAlpha = 0.06;
+      ctx.strokeStyle = C.wardenAura; ctx.lineWidth = aur - 20;
+      ctx.beginPath(); ctx.arc(x, y, (aur + 20) / 2, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  } else {
+    /* Boss：八边形 + 反向内环 + 3 点核心 */
+    ctx.save();
+    ctx.translate(x, y);
+    polyPath(0, 0, 28, 8, Math.PI / 8);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = TH.danger; ctx.lineWidth = 2; ctx.stroke();
+    /* 内环：反向旋转；损伤阶段用「断口数 0/1/2/3」编码（主编码，不依赖颜色） */
+    var frac = Math.max(0, e.hp / e.maxHp);
+    var stage = frac > 0.75 ? 0 : (frac > 0.50 ? 1 : (frac > 0.25 ? 2 : 3));
+    var ringCol = [TH.danger, C.bossStage2, TH.warn, C.white][stage];
+    var spin = -(e.tMs % 5000) / 5000 * TAU;
+    ctx.strokeStyle = ringCol; ctx.lineWidth = 2;
+    for (var gi = 0; gi < 3; gi++) {
+      var gapStart = spin + gi * TAU / 3 + 0.349;   /* 40° 缺口，三等分均布 */
+      if (gi < stage) continue;
+      ctx.beginPath();
+      ctx.arc(0, 0, 18, gapStart, gapStart + TAU / 3 - 0.698);
+      ctx.stroke();
+    }
+    ctx.restore();
+    for (var i = 0; i < 3; i++) {
+      var a = -Math.PI / 2 + i * TAU / 3 + (e.tMs % 3000) / 3000 * TAU;
+      circle(x + Math.cos(a) * 7, y + Math.sin(a) * 7, 3, C.white);
+    }
+    /* 脉冲环 900ms（双 Boss 同屏时收窄到 R30/α0.10，避免两环交叠成噪点） */
+    var twin = 0, q;
+    for (q = 0; q < G.enemies.length; q++) if (G.enemies[q].alive && G.enemies[q].isBoss) twin++;
+    var ph = (e.tMs % 900) / 900;
+    ctx.globalAlpha = (twin > 1 ? 0.10 : 0.15) + (twin > 1 ? 0.10 : 0.35) * Math.sin(ph * Math.PI);
+    ring(x, y, twin > 1 ? 30 : 34, TH.danger, 2);
+    ctx.globalAlpha = 1;
+    /* 召唤预告：R20→40 扩散环（400ms），先于召唤物出现 */
+    if (e.ringMs > 0) {
+      var rk = 1 - e.ringMs / BOSS_TG_MS;
+      ctx.globalAlpha = 0.85 * (1 - rk);
+      ring(x, y, 20 + rk * 20, C.wardenAura, 2);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* 减速霜环（1px 冰蓝 α0.25） */
+  if (e.slowPct > 0 || e.mortarSlowPct > 0) {
+    ctx.globalAlpha = 0.6;
+    ring(x, y, e.isBoss ? 30 : 13, PALETTE.tower.C, 1);
+    ctx.globalAlpha = 1;
+  }
+  /* 霜蚀降甲标记（C Lv3） */
+  if (e.frost > 0) {
+    ctx.globalAlpha = 0.85;
+    for (var f = 0; f < 3; f++) {
+      var fa = e.tMs / 900 + f * TAU / 3;
+      circle(x + Math.cos(fa) * (e.isBoss ? 32 : 15), y + Math.sin(fa) * (e.isBoss ? 32 : 15), 1.6, C.iceLight);
+    }
+    ctx.globalAlpha = 1;
+  }
+  /* 护盾减伤指示 */
+  if (e.auraMul < 1) {
+    ctx.globalAlpha = 0.5;
+    ring(x, y, e.isBoss ? 31 : 14, TH.ok, 1.5);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 血条：长度 + 颜色 + 数字三重编码 */
+  if (e.hp < e.maxHp || e.isBoss) {
+    var w = e.isBoss ? 56 : 22;
+    var hh = e.isBoss ? 5 : 3;
+    var by = y - (e.isBoss ? 40 : 20);
+    var frac = Math.max(0, e.hp / e.maxHp);
+    fillRect(x - w / 2, by, w, hh, C.bg);
+    var hcol = frac <= 0.25 ? TH.danger : (frac <= 0.5 ? TH.warn : TH.accent);
+    fillRect(x - w / 2, by, w * frac, hh, hcol);
+    strokeRect(x - w / 2, by, w, hh, C.grid, 1);
+    if (e.isBoss || e.type === 'BULWARK' || e.type === 'WARDEN') {
+      text(Math.ceil(e.hp) + '', x, by - 4, 12, C.text, 'center', 600, true);
+    }
+  }
+  /* 护甲标记（可读性：ARM 数字直接在体侧） */
+  if (e.arm > 0 && (e.type === 'BULWARK' || e.isBoss)) {
+    text('A' + Math.round(Math.max(0, e.arm - e.frost)), x, y + (e.isBoss ? 44 : 20), 12, C.text2, 'center', 600, true);
+  }
+}
+
+/* ============================================================ 29. 局内 HUD */
+function drawTopBar() {
+  /* 基地 HP（顶栏最左，P0） */
+  ctx.fillStyle = TH.danger;
+  ctx.beginPath();
+  ctx.moveTo(20, 24); ctx.lineTo(30, 24); ctx.lineTo(34, 30); ctx.lineTo(30, 36);
+  ctx.lineTo(30, 40); ctx.lineTo(20, 40); ctx.lineTo(20, 36); ctx.lineTo(24, 30);
+  ctx.closePath(); ctx.fill();
+  text(G.baseHP + ' / ' + G.baseMax, 82, 41, 16, G.baseHP <= 5 ? TH.danger : C.text, 'left', 600, true);
+
+  /* 金币（P0，等宽防跳动） */
+  circle(188, 32, 8, TH.warn);
+  circle(188, 32, 4, C.topbar);
+  text(G.gold + '', 242, 41, 16, TH.warn, 'left', 600, true);
+
+  /* 当前波次 N / 12（固定 12，三图通用） */
+  /* 波间间隙显示「即将开始的波」；交战中显示当前波 */
+  var showWave = G.phase === 'PREP' ? Math.min(12, G.wave + 1) : Math.max(1, G.wave);
+  text('WAVE ' + showWave + ' / 12', 380, 30, 16, C.text, 'left', 600, true);
+  var prog = Math.min(1, (G.cleared + (G.phase === 'WAVE' ? 0.5 : 0)) / 12);
+  fillRect(380, 38, 220, 8, C.path);
+  fillRect(380, 38, 220 * prog, 8, TH.accent);
+  strokeRect(380, 38, 220, 8, C.grid, 1);
+
+  /* 下一波倒计时：右对齐 x=960；最后 5 秒 → 警告色 + 上下跳动（非仅变色，A1） */
+  var jump = 0;
+  if (G.phase === 'PREP') {
+    var remainMs = Math.max(0, GAP_MS - G.gapMs);
+    var warn = remainMs <= 5000;
+    if (warn && !UI.reducedMotion) jump = ((remainMs / 160) | 0) % 2 ? -2 : 2;
+    text('下一波 ' + (remainMs / 1000).toFixed(1) + 's', 960, 35 + jump, 16,
+      warn ? TH.warn : C.text, 'right', 600, true);
+  } else if (G.phase === 'WAVE') {
+    text('交战中', 960, 35, 16, TH.accent, 'right', 600, true);
+  } else {
+    text('已结束', 960, 35, 16, C.text2, 'right', 600, true);
+  }
+
+  /* 元进程生效角标（P4） */
+  if (techCount() > 0) {
+    polyPath(1006, 32, 10, 6, Math.PI / 6);
+    ctx.fillStyle = TH.ok; ctx.fill();
+    text('' + techCount(), 1006, 36, 12, C.bg, 'center', 700, true);
+  }
+
+  /* 倍速三档 36×24 @1064/1104/1144（当前档另有 20×2 下划线，非仅颜色） */
+  for (var i = 0; i < 3; i++) {
+    var sr = UI.speedRects[i], on = (!G.paused && G.speed === i + 1);
+    fillRect(sr.x, sr.y, sr.w, sr.h, on ? rgba(TH.accent, 0.18) : C.path);
+    strokeRect(sr.x, sr.y, sr.w, sr.h, on ? TH.accent : C.grid, on ? 1.5 : 1);
+    text((i + 1) + '×', sr.x + sr.w / 2, sr.y + 17, 13, on ? TH.accent : C.text2, 'center', 600, true);
+    if (on) fillRect(sr.x + 8, sr.y + sr.h - 2, 20, 2, TH.accent);
+    if (focusedId() === 'spd' + i) focusBrackets(sr.x, sr.y, sr.w, sr.h, TH.accent);
+  }
+  /* 暂停 / 设置 */
+  var pr = UI.pauseRect;
+  strokeRect(pr.x, pr.y, pr.w, pr.h, G.paused ? TH.warn : C.grid, 2);
+  if (G.paused) {
+    ctx.fillStyle = C.text2;
+    ctx.beginPath(); ctx.moveTo(pr.x + 8, pr.y + 6); ctx.lineTo(pr.x + 19, pr.y + 12); ctx.lineTo(pr.x + 8, pr.y + 18); ctx.closePath(); ctx.fill();
+  } else {
+    fillRect(pr.x + 7, pr.y + 5, 4, 14, TH.warn);
+    fillRect(pr.x + 14, pr.y + 5, 4, 14, TH.warn);
+  }
+  if (focusedId() === 'pause') focusBrackets(pr.x, pr.y, pr.w, pr.h, TH.accent);
+  var gr = UI.setRect;
+  strokeRect(gr.x, gr.y, gr.w, gr.h, C.grid, 2);
+  ring(gr.x + 12, gr.y + 12, 5, C.text2, 1.5);
+  circle(gr.x + 12, gr.y + 12, 1.6, C.text2);
+  if (focusedId() === 'set') focusBrackets(gr.x, gr.y, gr.w, gr.h, TH.accent);
+}
+
+function drawBottomBar() {
+  var nx = UI.nextRect;
+  var canCall = (G.phase === 'PREP' && G.state === 'PLAY');
+  if (canCall) {
+    var bonus = gapRemainSec() * 2;
+    strokeRect(nx.x, nx.y, nx.w, nx.h, TH.accent, 2);
+    fillRect(nx.x, nx.y, nx.w, nx.h, rgba(TH.accent, 0.10));
+    text(bonus > 0 ? '提前召唤 +' + bonus : '提前召唤', nx.x + nx.w / 2, nx.y + 22, 15, TH.accent, 'center', 600);
+    text('[空格]', nx.x + nx.w / 2, nx.y + 40, 12, C.text2, 'center', 400);
+  } else {
+    strokeRect(nx.x, nx.y, nx.w, nx.h, C.locked, 2);
+    text('交战中…', nx.x + nx.w / 2, nx.y + 30, 15, C.text2, 'center', 600);
+    disabledCross(nx.x + nx.w - 22, nx.y + 24, 12, C.locked);
+  }
+  if (focusedId() === 'next') focusBrackets(nx.x, nx.y, nx.w, nx.h, TH.accent);
+  drawPreview();
+}
+/* 下一波预览条：(16,656) 752×48，6 槽 宽104 起点x=88 步长111（末槽止 747）
+   必须排在「提前召唤」按钮之前（左），否则玩家在信息不全时决策，违反 P1 */
+function drawPreview() {
+  var r = UI.previewRect;
+  fillRect(r.x, r.y, r.w, r.h, C.ground);
+  strokeRect(r.x, r.y, r.w, r.h, C.grid, 1);
+  text('下一波', 24, r.y + 29, 12, C.text2, 'left', 600);
+  var idx = Math.min(11, G.wave);
+  var wd = WAVES[G.mapId][idx];
+  if (!wd) return;
+  var acc = [], k, code, n;
+  function add(def) {
+    if (!def) return;
+    for (k in def) {
+      if (!def.hasOwnProperty(k) || k === 'bossHP') continue;
+      code = WAVE_CODE[k];
+      if (!code) continue;
+      n = def[k];
+      var found = null, j;
+      for (j = 0; j < acc.length; j++) if (acc[j].code === code) found = acc[j];
+      if (found) found.n += n;
+      else acc.push({ code: code, n: n });
+    }
+  }
+  add(wd); if (wd.A || wd.B) { add(wd.A); add(wd.B); }
+  var slot = 0, sx, se;
+  for (k = 0; k < acc.length && slot < 6; k++, slot++) {
+    se = ENEMIES[acc[k].code];
+    sx = 88 + slot * 111;
+    drawEnemyIcon(se, sx + 11, r.y + 20, 0.62);
+    text('×' + acc[k].n, sx + 26, r.y + 25, 12, C.text, 'left', 600, true);
+    text('ARM ' + se.arm, sx + 2, r.y + 41, 12, se.arm > 0 ? TH.warn : C.text2, 'left', 600, true);
+  }
+  text('第 ' + (idx + 1) + ' 波', r.x + r.w - 10, r.y + 29, 12, C.text2, 'right', 400);
+}
+function drawEnemyIcon(def, cx, cy, scale) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(scale, scale);
+  if (def.shape === 'tri') { polyPath(0, 0, 11, 3, Math.PI / 2); }
+  else if (def.shape === 'diamond') { ctx.beginPath(); ctx.moveTo(11, 0); ctx.lineTo(0, 6); ctx.lineTo(-11, 0); ctx.lineTo(0, -6); ctx.closePath(); }
+  else if (def.shape === 'rect') { roundRectPath(-7, -7, 14, 14, 3); }
+  else if (def.shape === 'vwing') { ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(-10, 8); ctx.lineTo(0, 3); ctx.lineTo(10, 8); ctx.closePath(); }
+  else if (def.shape === 'hex') { polyPath(0, 0, 12, 6, Math.PI / 6); }
+  else { polyPath(0, 0, 13, 8, Math.PI / 8); }
+  ctx.fillStyle = def.color; ctx.fill();
+  ctx.strokeStyle = rgba(C.edge, 0.5); ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.restore();
+}
+
+/* 建造栏 4 卡（动态值） */
+function drawCards() {
+  var dominant = dominantArmor();
+  var i;
+  for (i = 0; i < 4; i++) {
+    var id = TOWER_IDS[i], def = TOWERS[id], cy = UI.cardY[i], ch = UI.cardH;
+    var cost = def.cum[0];
+    var can = G.gold >= cost;
+    var sel = G.buildType === id;
+    if (sel) strokeRect(UI.cardX, cy, UI.cardW, ch, def.color, 3);
+    if (!can) {
+      /* 可负担态：斜纹 + 斜十字（禁用语义不靠颜色，art-bible §3.4） */
+      ctx.save();
+      ctx.beginPath(); ctx.rect(UI.cardX, cy, UI.cardW, ch); ctx.clip();
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = C.locked; ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (var s2 = -ch; s2 < UI.cardW; s2 += 16) {
+        ctx.moveTo(UI.cardX + s2, cy + ch); ctx.lineTo(UI.cardX + s2 + ch, cy);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      disabledCross(UI.cardX + UI.cardW - 22, cy + 52, 14, C.locked);
+    }
+    /* 造价（16px 等宽，宽度不跳动） */
+    text(cost + 'G', 1068, cy + 48, 16, can ? TH.warn : C.text2, 'left', 600, true);
+    /* 有效 DPS：按「下一波占比最高的护甲」动态换算（GDD §3.7 / P1） */
+    var dpsTxt;
+    if (id === 'C') {
+      dpsTxt = '减速' + Math.round(def.lv[0].slow * 100) + '% ' + def.lv[0].dps.toFixed(1) + '/目标';
+    } else {
+      var lv0 = def.lv[0];
+      var r = dmgCalc(lv0.dmg * MOD.dmgMul, dominant, effPen(lv0.pen || 0));
+      var dps = lv0.dmg * MOD.dmgMul * (1000 / lv0.cdMs) * (1 - r.mit);
+      dpsTxt = dps.toFixed(1) + ' vs ARM' + dominant + (id === 'B' ? ' ×2.6' : '');
+    }
+    text(dpsTxt, 1024, cy + 70, 14, can ? C.text : C.text2, 'left', 600, true);
+  }
+  /* 科技加成提示 */
+  var bonus = [];
+  if (save.tech.F1) bonus.push('伤害+8%');
+  if (save.tech.F3) bonus.push('穿甲+20%');
+  if (save.tech.E1) bonus.push('回收85%');
+  if (save.tech.D1) bonus.push('HP+5');
+  if (save.tech.D2) bonus.push('每波回1');
+  if (save.tech.E3) bonus.push('利息6%');
+  if (save.tech.E2) bonus.push('赏金+12%');
+  if (save.tech.F2) bonus.push('溅射+25%');
+  if (bonus.length) text(bonus.join(' '), 1256, 78, 12, C.text2, 'right', 400);
+}
+/* 选中塔详情 */
+function drawTowerPanel() {
+  var p = UI.towerPanel, t = G.selTower;
+  if (!t) {
+    text('未选中防御塔', p.x + p.w / 2, p.y + 30, 14, C.text2, 'center', 400);
+    text('点空位建造 · 点塔查看详情', p.x + p.w / 2, p.y + 58, 12, C.text2, 'center', 400);
+    text('1-4 选塔种 · Esc 取消 · [ ] 倍速', p.x + p.w / 2, p.y + 84, 12, C.text2, 'center', 400);
+    return;
+  }
+  var dominant = dominantArmor();
+  text(t.def.name, p.x + 12, p.y + 24, 20, t.def.color, 'left', 600);
+  /* 等级：3 个 8×8 方块（形状编码，非颜色） */
+  for (var li = 0; li < 3; li++) {
+    fillRect(p.x + 12 + li * 12, p.y + 38, 8, 8, li <= t.lv ? t.def.color : C.grid);
+    strokeRect(p.x + 12 + li * 12, p.y + 38, 8, 8, C.grid, 1);
+  }
+  /* 当前 / 升级后有效 DPS（vs 下一波主要护甲） */
+  function effDps(lv) {
+    var d = t.def.lv[lv];
+    if (t.def.kind === 'aura') return d.dps;
+    var rr = dmgCalc(d.dmg * MOD.dmgMul, dominant, effPen(d.pen || 0));
+    return d.dmg * MOD.dmgMul * (1000 / d.cdMs) * (1 - rr.mit);
+  }
+  var dpsNow = effDps(t.lv);
+  var dpsNext = t.lv < 2 ? effDps(t.lv + 1) : 0;
+  text('DPS ' + dpsNow.toFixed(1) + (t.lv < 2 ? ' → ' + dpsNext.toFixed(1) : ''),
+    p.x + p.w - 12, p.y + 50, 16, C.text, 'right', 600, true);
+  /* 关键数值一行 */
+  var line;
+  if (t.def.kind === 'aura') {
+    line = '减速 ' + Math.round(towerSlow(t) * 100) + '% · 射程 ' + Math.round(towerRng(t));
+  } else {
+    line = '伤害 ' + Math.round(towerDmg(t)) + ' · 射程 ' + Math.round(towerRng(t)) +
+      ' · 间隔 ' + (towerCd(t) / 1000).toFixed(2) + 's';
+  }
+  text(line, p.x + 12, p.y + 70, 12, C.text2, 'left', 400);
+  /* 升级 / 出售 */
+  var upR = { x: p.x + 12, y: p.y + 78, w: 148, h: 34 };
+  var slR = { x: p.x + 164, y: p.y + 78, w: 80, h: 34 };
+  if (t.lv < 2) {
+    var uc = upgradeCost(t), canUp = G.gold >= uc;
+    strokeRect(upR.x, upR.y, upR.w, upR.h, canUp ? TH.ok : C.locked, 2);
+    text('升级 ' + uc + 'G', upR.x + upR.w / 2, upR.y + 22, 14, canUp ? TH.ok : C.text2, 'center', 600);
+    if (!canUp) disabledCross(upR.x + upR.w - 14, upR.y + 17, 9, C.locked);
+  } else {
+    strokeRect(upR.x, upR.y, upR.w, upR.h, C.grid, 2);
+    text('已满级 Lv3', upR.x + upR.w / 2, upR.y + 22, 14, C.text2, 'center', 600);
+  }
+  strokeRect(slR.x, slR.y, slR.w, slR.h, TH.danger, 2);
+  text('出售 ' + sellValue(t), slR.x + slR.w / 2, slR.y + 22, 14, TH.danger, 'center', 600);
+}
+
+/* 绘制入口：局内 */
+function drawPlay(dtMs) {
+  if (bgDirty) renderStatic();
+  ctx.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+  ctx.fillStyle = C.black;
+  ctx.fillRect(0, 0, VIEW.w, VIEW.h);
+  var s = VIEW.scale * VIEW.dpr;
+  var ox = (VIEW.ox + shakeX()) * VIEW.dpr;
+  var oy = (VIEW.oy + shakeY()) * VIEW.dpr;
+  ctx.setTransform(s, 0, 0, s, ox, oy);
+
+  ctx.drawImage(bgCanvas, 0, 0);
+
+  drawBase();
+  drawRangeCircles();
+  drawSites(dtMs);
+  drawTowers(dtMs);
+  var i;
+  for (i = 0; i < G.enemies.length; i++) if (G.enemies[i].alive) drawEnemy(G.enemies[i]);
+  drawShots();
+  pDraw();
+
+  drawTopBar();
+  drawBottomBar();
+  drawCards();
+  drawTowerPanel();
+
+  /* 暂停压暗（仍完全可读） */
+  if (G.paused) {
+    ctx.globalAlpha = 0.30;
+    fillRect(FIELD_X, FIELD_Y, FIELD_W, FIELD_H, C.black);
+    ctx.globalAlpha = 1;
+  }
+  /* 漏怪红罩 */
+  if (G.flashMs > 0) {
+    var k = G.flashMs / Math.max(1, G.flashMax);
+    var a = Math.sin((1 - k) * Math.PI) * 0.28;
+    ctx.globalAlpha = a;
+    fillRect(FIELD_X, FIELD_Y, FIELD_W, FIELD_H, TH.danger);
+    ctx.globalAlpha = 1;
+  }
+  /* Boss 出场暗角 */
+  if (G.bossFlashMs > 0 && !UI.reducedMotion) {
+    var bk = G.bossFlashMs / 1600;
+    ctx.globalAlpha = Math.sin(bk * Math.PI) * 0.5;
+    fillRect(FIELD_X, FIELD_Y, FIELD_W, 40, C.black);
+    fillRect(FIELD_X, FIELD_Y + FIELD_H - 40, FIELD_W, 40, C.black);
+    fillRect(FIELD_X, FIELD_Y, 40, FIELD_H, C.black);
+    fillRect(FIELD_X + FIELD_W - 40, FIELD_Y, 40, FIELD_H, C.black);
+    ctx.globalAlpha = 1;
+  }
+  /* 波次横幅 */
+  if (G.banner.ms > 0) {
+    var t = 1 - G.banner.ms / Math.max(1, G.banner.max);
+    var slide = 0, alpha = 1;
+    if (t < 0.21) { slide = -40 * (1 - (t / 0.21)); alpha = Math.min(1, t / 0.1 + 0.2); }
+    else if (t > 0.79) { alpha = Math.max(0, (1 - t) / 0.21); }
+    ctx.globalAlpha = alpha;
+    fillRect(240, 300 + slide, 520, 64, rgba(C.ground, 0.92));
+    fillRect(240, 300 + slide, 520, 2, TH.accent);
+    fillRect(240, 362 + slide, 520, 2, TH.accent);
+    text(G.banner.text, 500, 342 + slide, 20, TH.accent, 'center', 700);
+    ctx.globalAlpha = 1;
+  }
+  /* 操作提示条 */
+  if (G.hintMs > 0) {
+    ctx.globalAlpha = Math.min(1, G.hintMs / 400);
+    var hw = textW(G.hintText, 13, 600) + 28;
+    fillRect(500 - hw / 2, 690 - 26, hw, 26, rgba(C.ground, 0.94));
+    strokeRect(500 - hw / 2, 690 - 26, hw, 26, TH.warn, 1);
+    text(G.hintText, 500, 694, 13, TH.warn, 'center', 600);
+    ctx.globalAlpha = 1;
+  }
+  /* 焦点环（兜底：卡片/按钮已各自绘制） */
+}
+var shakeT = 0;
+function shakeX() { return shakeT > 0 ? Math.sin(shakeT * 0.09) * G.shakeMagPx : 0; }
+function shakeY() { return shakeT > 0 ? Math.cos(shakeT * 0.13) * G.shakeMagPx : 0; }
+
+/* ========================================================= 30. 主菜单/地图卡 */
+function setLogical() {
+  ctx.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+  ctx.fillStyle = C.black;
+  ctx.fillRect(0, 0, VIEW.w, VIEW.h);
+  var s = VIEW.scale * VIEW.dpr;
+  ctx.setTransform(s, 0, 0, s, VIEW.ox * VIEW.dpr, VIEW.oy * VIEW.dpr);
+}
+function drawMapThumb(mapId, x, y, w, h) {
+  var def = MAPS[mapId];
+  var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9, i, j;
+  for (i = 0; i < def.paths.length; i++) {
+    for (j = 0; j < def.paths[i].length; j++) {
+      var p = def.paths[i][j];
+      if (p[0] < minX) minX = p[0];
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] < minY) minY = p[1];
+      if (p[1] > maxY) maxY = p[1];
+    }
+  }
+  fillRect(x, y, w, h, C.ground);
+  var pad = 12;
+  var sc = Math.min((w - pad * 2) / Math.max(1, maxX - minX), (h - pad * 2) / Math.max(1, maxY - minY));
+  var ox = x + (w - (maxX - minX) * sc) / 2 - minX * sc;
+  var oy = y + (h - (maxY - minY) * sc) / 2 - minY * sc;
+  /* 点位 */
+  for (i = 0; i < def.pts.length; i++) {
+    var q = def.pts[i];
+    var px = ox + q[0] * 40 + 20 * sc + (GRID_OX) * sc - 0 * sc;
+    var py = oy + (GRID_OY + q[1] * 40 + 20) * sc;
+    px = ox + (q[0] * 40 + 20) * sc;
+    ctx.globalAlpha = 0.75;
+    circle(px, py, 1.6, q.length > 3 && q[3] ? TH.warn : C.text2);
+    ctx.globalAlpha = 1;
+  }
+  /* 路径 */
+  ctx.strokeStyle = C.path; ctx.lineWidth = 5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (i = 0; i < def.paths.length; i++) {
+    ctx.beginPath();
+    for (j = 0; j < def.paths[i].length; j++) {
+      var pp = def.paths[i][j];
+      var sx = ox + pp[0] * sc, sy = oy + pp[1] * sc;
+      if (j === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    }
+    ctx.stroke();
+  }
+  /* 基地 */
+  var bx = ox + def.base[0] * sc, by = oy + def.base[1] * sc;
+  fillRect(bx - 5, by - 5, 10, 10, TH.accent);
+  strokeRect(x, y, w, h, C.grid, 1);
+}
+function drawMenu(dtMs) {
+  setLogical();
+  fillRect(0, 0, LW, LH, C.bg);
+  /* 背景栅格装饰 */
+  ctx.globalAlpha = 0.25;
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (var g = 0; g < LW; g += 40) { ctx.moveTo(g + 0.5, 0); ctx.lineTo(g + 0.5, LH); }
+  for (g = 0; g < LH; g += 40) { ctx.moveTo(0, g + 0.5); ctx.lineTo(LW, g + 0.5); }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  text('铁幕防线', 64, 210, 40, C.text, 'left', 700);
+  text('IRON VEIL', 64, 240, 14, TH.accent, 'left', 600, true);
+  text('用四种互相咬合的火力，把十二波钢铁洪流按计算逐层剥开。', 64, 280, 14, C.text2, 'left', 400);
+  text('单一护甲公式 · 建造点位固定 · 每一局都留下科技点', 64, 304, 12, C.text2, 'left', 400);
+
+  /* 战绩摘要 */
+  var by = 360;
+  text('累计科技点', 64, by, 12, C.text2, 'left', 400);
+  text(save.tp + '', 168, by, 20, TH.accent, 'left', 600, true);
+  text('累计击杀', 64, by + 28, 12, C.text2, 'left', 400);
+  text((save.totalKills || 0) + '', 168, by + 28, 20, C.text, 'left', 600, true);
+  for (var mi = 0; mi < 3; mi++) {
+    var mid = MAP_IDS[mi];
+    text(MAPS[mid].name + ' 最佳', 64, by + 62 + mi * 22, 12, C.text2, 'left', 400);
+    text(save.bestWave[mid] + ' / 12', 190, by + 62 + mi * 22, 12, save.bestWave[mid] > 0 ? C.text : C.text2, 'left', 600, true);
+    text(save.firstClear[mid] ? '已通关' : '未通关', 300, by + 62 + mi * 22, 12, save.firstClear[mid] ? TH.ok : C.text2, 'left', 400);
+  }
+
+  /* 地图卡 */
+  for (var i = 0; i < 3; i++) {
+    var id = MAP_IDS[i], def = MAPS[id];
+    var x = MENU_CARD_X[i], y = 210, w = 226, h = 300;
+    var unlocked = mapUnlocked(id);
+    var sel = G.mapId === id;
+    fillRect(x, y, w, h, C.panel);
+    strokeRect(x, y, w, h, sel ? TH.accent : C.grid, sel ? 3 : 2);
+    ctx.globalAlpha = unlocked ? 1 : 0.45;
+    drawMapThumb(id, x + 8, y + 8, w - 16, 140);
+    ctx.globalAlpha = 1;
+    text(def.name, x + 12, y + 178, 20, unlocked ? C.text : C.text2, 'left', 700);
+    text(def.sub, x + 12, y + 200, 12, unlocked ? C.text2 : C.text2, 'left', 400);
+    /* 难度 3 个方块 */
+    for (var d = 0; d < 3; d++) {
+      if (d < def.diff) fillRect(x + 12 + d * 12, y + 214, 8, 8, unlocked ? TH.warn : C.locked);
+      else strokeRect(x + 12 + d * 12, y + 214, 8, 8, C.grid, 1);
+    }
+    text('点位 ' + def.pts.length + ' · 基地 ' + (def.baseHP + MOD.baseHPAdd) + ' HP', x + 12, y + 246, 12, unlocked ? C.text2 : C.text2, 'left', 400);
+    text('初始金币 ' + def.gold, x + 12, y + 266, 12, unlocked ? C.text2 : C.text2, 'left', 400);
+    text('基准科技 ' + def.baseTP + ' TP', x + 12, y + 286, 12, unlocked ? C.text2 : C.text2, 'left', 400);
+    if (!unlocked) {
+      ctx.globalAlpha = 1;
+      /* 锁形图元 + 解锁条件 */
+      fillRect(x + w / 2 - 12, y + 96, 24, 20, C.locked);
+      ring(x + w / 2, y + 96, 10, C.locked, 4);
+      fillRect(x + 8, y + 158, w - 16, 26, rgba(C.bg, 0.9));
+      text('锁定：' + unlockText(id), x + w / 2, y + 176, 12, TH.warn, 'center', 600);
+    }
+    ctx.globalAlpha = 1;
+    if (focusedId() === 'map' + i) focusBrackets(x, y, w, h, TH.accent);
+  }
+
+  /* 底部按钮 */
+  var canStart = mapUnlocked(G.mapId);
+  strokeRect(64, 640, 280, 56, canStart ? TH.accent : C.locked, 2);
+  fillRect(64, 640, 280, 56, canStart ? rgba(TH.accent, 0.10) : rgba(C.locked, 0.10));
+  text(canStart ? '开始部署 · ' + MAPS[G.mapId].name : '该地图未解锁', 204, 674, 16, canStart ? TH.accent : C.text2, 'center', 600);
+  strokeRect(360, 640, 200, 56, TH.ok, 2);
+  text('科技树 (' + save.tp + ' TP)', 460, 674, 15, TH.ok, 'center', 600);
+  /* 设置按钮 */
+  strokeRect(1180, 24, 76, 32, C.grid, 2);
+  text('设置', 1218, 45, 13, C.text2, 'center', 600);
+  if (focusedId() === 'start') focusBrackets(64, 640, 280, 56, TH.accent);
+  if (focusedId() === 'tech') focusBrackets(360, 640, 200, 56, TH.accent);
+  if (focusedId() === 'settings') focusBrackets(1180, 24, 76, 32, TH.accent);
+
+  if (saveWarn) {
+    fillRect(64, 600, 700, 28, rgba(TH.warn, 0.14));
+    strokeRect(64, 600, 700, 28, TH.warn, 1);
+    text(saveWarn, 78, 619, 12, TH.warn, 'left', 600);
+  }
+  if (G.hintMs > 0) {
+    text(G.hintText, 760, 620, 13, TH.warn, 'center', 600);
+  }
+  void dtMs;
+}
+
+/* ============================================================== 31. 结算界面 */
+function drawResult() {
+  setLogical();
+  if (G.map) {
+    /* 底图：局内战场静态层 */
+    if (bgDirty) renderStatic();
+    ctx.drawImage(bgCanvas, 0, 0);
+  } else fillRect(0, 0, LW, LH, C.bg);
+  ctx.fillStyle = rgba(C.bg, 0.88);
+  ctx.fillRect(0, 0, LW, LH);
+
+  var r = G.result || { win: false, tp: 0, tpBase: 0, firstBonus: 0, kills: 0, leaks: {}, leaksTotal: 0, timeMs: 0, cleared: 0 };
+  var px = 280, py = 120, pw = 720, ph = 480;
+  fillRect(px, py, pw, ph, C.panel);
+  strokeRect(px, py, pw, ph, C.grid, 2);
+  text(r.win ? '防线守住了' : '防线失守', px + pw / 2, py + 70, 40, r.win ? TH.accent : TH.danger, 'center', 700);
+  text(MAPS[G.mapId].name + ' · 已清 ' + r.cleared + ' / 12 波', px + pw / 2, py + 100, 14, C.text2, 'center', 400);
+
+  /* 三列统计 */
+  var cols = [
+    ['击杀', r.kills + ''],
+    ['漏怪', r.leaksTotal + ''],
+    ['用时', fmtTime(r.timeMs)]
+  ];
+  var ci;
+  for (ci = 0; ci < 3; ci++) {
+    var cx = px + 120 + ci * 240;
+    text(cols[ci][0], cx, py + 150, 12, C.text2, 'center', 400);
+    text(cols[ci][1], cx, py + 190, 28, C.text, 'center', 600, true);
+  }
+  /* 漏怪分类 */
+  var keys = Object.keys(r.leaks), lx = px + 40, ly = py + 220;
+  text('漏怪类型分布', lx, ly, 12, C.text2, 'left', 400);
+  if (!keys.length) text('无（完美防守）', lx + 110, ly, 12, TH.ok, 'left', 600);
+  else {
+    var total = 0;
+    for (ci = 0; ci < keys.length; ci++) total += r.leaks[keys[ci]];
+    var bx2 = lx;
+    for (ci = 0; ci < keys.length; ci++) {
+      var e = ENEMIES[keys[ci]];
+      var cnt = r.leaks[keys[ci]];
+      var bw = Math.max(60, 380 * cnt / Math.max(1, total));
+      drawEnemyIcon(e, bx2 + 10, ly + 26, 0.62);
+      text(e.name + ' ' + cnt, bx2 + 22, ly + 30, 12, C.text, 'left', 600);
+      bx2 += bw + 6;
+    }
+  }
+  /* 科技点 */
+  fillRect(px + 40, py + 276, pw - 80, 76, rgba(TH.accent, 0.08));
+  strokeRect(px + 40, py + 276, pw - 80, 76, TH.accent, 1);
+  text('本局获得 ' + r.tp + ' 科技点', px + pw / 2, py + 306, 20, TH.accent, 'center', 700);
+  var detail = '基础 ' + r.tpBase + ' TP（地图基准 × 已清比例 × 剩余 HP 系数）';
+  if (r.firstBonus > 0) detail += '   ＋首通奖励 ' + r.firstBonus + ' TP';
+  text(detail, px + pw / 2, py + 330, 12, C.text2, 'center', 400);
+  /* 一句话引导 */
+  var nextTech = nextAffordableTech();
+  text(nextTech ? ('“本局获得 ' + r.tp + ' 科技点，够点亮【' + nextTech + '】。”')
+    : ('“累计 ' + save.tp + ' TP — 继续攒点解锁更强开局。”'), px + pw / 2, py + 372, 13, C.text, 'center', 400);
+
+  /* 三按钮 */
+  var bx = [340, 560, 780];
+  var names = ['重玩本图', '前往科技树', '返回地图选择'];
+  for (ci = 0; ci < 3; ci++) {
+    strokeRect(bx[ci], 508, 200, 48, ci === 1 ? TH.ok : TH.accent, 2);
+    text(names[ci], bx[ci] + 100, 538, 15, ci === 1 ? TH.ok : TH.accent, 'center', 600);
+  }
+  if (focusedId() === 'replay') focusBrackets(340, 508, 200, 48, TH.accent);
+  if (focusedId() === 'totech') focusBrackets(560, 508, 200, 48, TH.accent);
+  if (focusedId() === 'tomap') focusBrackets(780, 508, 200, 48, TH.accent);
+}
+function nextAffordableTech() {
+  for (var i = 0; i < TECH_IDS.length; i++) {
+    var id = TECH_IDS[i], t = TECH[id];
+    if (save.tech[id]) continue;
+    if (t.pre && !save.tech[t.pre]) continue;
+    if (save.tp >= t.cost) return t.name;
+  }
+  return null;
+}
+function fmtTime(ms) {
+  var s = Math.floor(ms / 1000);
+  var mm = Math.floor(s / 60), ss = s % 60;
+  return mm + ':' + (ss < 10 ? '0' : '') + ss;
+}
+
+/* ============================================================== 32. 科技树 */
+function techTooltip(id) {
+  var t = TECH[id], lit = !!save.tech[id];
+  var rows = [];
+  if (id === 'F1') rows = [['全塔伤害', '100% → 108%']];
+  if (id === 'F2') rows = [['溅射半径', '100% → 125%'], ['边缘衰减', '60% → 75%']];
+  if (id === 'F3') rows = [['全塔穿甲', '+0% → +20%']];
+  if (id === 'E1') rows = [['出售回收', '70% → 85%']];
+  if (id === 'E2') rows = [['击杀赏金', '100% → 112%']];
+  if (id === 'E3') rows = [['利息率', '4% → 6%'], ['利息上限', '40 → 70']];
+  if (id === 'D1') rows = [['基地 HP', '+0 → +5']];
+  if (id === 'D2') rows = [['每波回复', '0 → 1 HP']];
+  return { name: t.name, desc: t.desc, rows: rows, lit: lit, cost: t.cost, pre: t.pre ? TECH[t.pre].name : null };
+}
+function drawTech(dtMs) {
+  if (bgDirty) renderStatic();
+  setLogical();
+  fillRect(0, 0, LW, LH, C.bg);
+  ctx.globalAlpha = 0.2;
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (var g = 0; g < LW; g += 40) { ctx.moveTo(g + 0.5, 0); ctx.lineTo(g + 0.5, LH); }
+  for (g = 0; g < LH; g += 40) { ctx.moveTo(0, g + 0.5); ctx.lineTo(LW, g + 0.5); }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  text('科技树', 64, 60, 28, C.text, 'left', 700);
+  text('可用科技点', 64, 96, 12, C.text2, 'left', 400);
+  text(save.tp + ' TP', 160, 100, 28, TH.accent, 'left', 600, true);
+
+  var cols = ['F', 'E', 'D'], ci, i, id, pos;
+  for (ci = 0; ci < 3; ci++) {
+    text(BRANCH_NAME[cols[ci]] + '支线', TECH_COL[cols[ci]], 176, 20, C.text, 'center', 700);
+  }
+  /* 连线：严格按前置关系画（父→子），不是按数组顺序 */
+  for (i = 0; i < TECH_IDS.length; i++) {
+    id = TECH_IDS[i];
+    if (!TECH[id].pre) continue;
+    techLink(TECH[id].pre, id, !!(save.tech[TECH[id].pre] && save.tech[id]));
+  }
+  for (i = 0; i < TECH_IDS.length; i++) {
+    id = TECH_IDS[i];
+    var t = TECH[id];
+    pos = techNodePos(i);
+    var lit2 = !!save.tech[id];
+    var avail = !lit2 && (!t.pre || save.tech[t.pre]) && save.tp >= t.cost;
+    var lockedPre = !lit2 && t.pre && !save.tech[t.pre];
+    if (lit2) {
+      circle(pos.x, pos.y, 26, TH.accent);
+      circle(pos.x, pos.y, 8, C.white);
+    } else if (avail) {
+      var breath = 0.5 + 0.5 * Math.sin(dtMs / 1600 * TAU + i);
+      ctx.globalAlpha = 0.5 + 0.5 * breath;
+      ring(pos.x, pos.y, 26, TH.ok, 2);
+      ctx.globalAlpha = 1;
+      ring(pos.x, pos.y, 20, rgba(TH.ok, 0.35), 1);
+    } else {
+      ring(pos.x, pos.y, 26, C.locked, 1.5);
+      /* 锁形 */
+      fillRect(pos.x - 4, pos.y - 2, 8, 10, C.locked);
+      ring(pos.x, pos.y - 4, 3, C.locked, 1.5);
+    }
+    text(t.name, pos.x + 38, pos.y - 4, 14, lit2 ? TH.accent : (avail ? C.text : C.text2), 'left', 600);
+    text(t.cost + ' TP', pos.x + 38, pos.y + 14, 12, lit2 ? C.text2 : (avail ? TH.warn : C.text2), 'left', 400, true);
+    if (lockedPre) text('需 ' + TECH[t.pre].name, pos.x + 38, pos.y + 30, 12, C.text2, 'left', 400);
+    /* 四态之四：前置已点、仅 TP 不足。共用锁形图元，文案必须区分——
+       「差 N TP」= 去攒，「需 X」= 去点前置，两者行动相反，混同会让玩家为不存在的原因攒点 */
+    else if (!lit2 && !avail) text('差 ' + (t.cost - save.tp) + ' TP', pos.x + 38, pos.y + 30, 12, C.text2, 'left', 400);
+    if (focusedId() === 'tech_' + id) focusBrackets(pos.x - 26, pos.y - 26, 52, 52, TH.accent);
+  }
+
+  /* 常驻详情区 (240,500) 800×160：悬停或键盘焦点均在此显示「当前值 → 点亮后值」 */
+  var hovered = null, mx = mouse.x, my = mouse.y;
+  for (i = 0; i < TECH_IDS.length; i++) {
+    pos = techNodePos(i);
+    if (Math.hypot(mx - pos.x, my - pos.y) <= 28) { hovered = TECH_IDS[i]; break; }
+  }
+  if (!hovered) {
+    var fid = focusedId();
+    if (fid && fid.indexOf('tech_') === 0) hovered = fid.slice(5);
+  }
+  fillRect(240, 500, 800, 160, rgba(C.ground, 0.92));
+  strokeRect(240, 500, 800, 160, C.grid, 2);
+  if (hovered) {
+    var tt = techTooltip(hovered);
+    text(tt.name, 264, 530, 20, TH.accent, 'left', 700);
+    text(tt.desc, 264, 552, 12, C.text2, 'left', 400);
+    for (i = 0; i < tt.rows.length; i++) {
+      text(tt.rows[i][0], 264, 582 + i * 22, 14, C.text2, 'left', 400);
+      text(tt.rows[i][1], 540, 582 + i * 22, 14, C.text, 'left', 600, true);
+    }
+    text(tt.lit ? '已点亮' : ('消耗 ' + tt.cost + ' TP' + (tt.pre ? ' · 前置：' + tt.pre : ' · 无前置')),
+      1016, 640, 13, tt.lit ? TH.ok : TH.warn, 'right', 600);
+  } else {
+    text('悬停节点（或 Tab 聚焦）查看「当前值 → 点亮后值」', 640, 586, 14, C.text2, 'center', 400);
+  }
+
+  /* 底部 */
+  strokeRect(64, 656, 200, 44, C.grid, 2);
+  text('返回主菜单', 164, 684, 15, C.text2, 'center', 600);
+  strokeRect(1016, 656, 200, 44, TH.danger, 2);
+  text('重置存档', 1116, 684, 15, TH.danger, 'center', 600);
+  strokeRect(1180, 24, 76, 32, C.grid, 2);
+  text('设置', 1218, 45, 13, C.text2, 'center', 600);
+  if (focusedId() === 'techback') focusBrackets(64, 656, 200, 44, TH.accent);
+  if (focusedId() === 'techreset') focusBrackets(1016, 656, 200, 44, TH.accent);
+  if (focusedId() === 'settings') focusBrackets(1180, 24, 76, 32, TH.accent);
+
+  if (G.hintMs > 0) text(G.hintText, 640, 620, 13, TH.warn, 'center', 600);
+  if (saveWarn) {
+    fillRect(64, 588, 700, 26, rgba(TH.warn, 0.14));
+    text(saveWarn, 78, 606, 12, TH.warn, 'left', 600);
+  }
+
+  /* 重置二次确认 */
+  if (G.confirmReset) {
+    ctx.fillStyle = rgba(C.bg, 0.9);
+    ctx.fillRect(0, 0, LW, LH);
+    fillRect(300, 260, 680, 240, C.panel);
+    strokeRect(300, 260, 680, 240, TH.danger, 2);
+    text('确认重置存档？', 640, 320, 28, TH.danger, 'center', 700);
+    text('将清空全部科技点、科技节点、通关记录与最佳波次。此操作不可撤销。', 640, 360, 14, C.text, 'center', 400);
+    text('累计 ' + save.tp + ' TP · 科技 ' + techCount() + '/8 · 累计击杀 ' + save.totalKills, 640, 384, 12, C.text2, 'center', 400);
+    strokeRect(500, 400, 200, 48, TH.danger, 2);
+    text('确认重置', 600, 430, 15, TH.danger, 'center', 600);
+    strokeRect(720, 400, 160, 48, C.grid, 2);
+    text('取消', 800, 430, 15, C.text2, 'center', 600);
+  }
+}
+
+/* ================================================================ 33. 设置 */
+function drawSettings() {
+  ctx.fillStyle = rgba(C.bg, 0.90);
+  ctx.fillRect(0, 0, LW, LH);
+  var x = 360, y = 150, w = 560, h = 420;
+  fillRect(x, y, w, h, C.panel);
+  strokeRect(x, y, w, h, C.grid, 2);
+  text('设置', x + 28, y + 44, 28, C.text, 'left', 700);
+  text('可访问性选项（A5 / A3 / A4）', x + 28, y + 68, 12, C.text2, 'left', 400);
+
+  var rows = [
+    ['减少动效', '关闭屏幕抖动 / 红罩闪烁 / Boss 暗角；粒子 ≤3、时长 ≤120ms'],
+    ['色盲模式', '仅替换强调色与危险色映射，几何不变'],
+    ['UI 缩放', '仅缩放 HUD 文本，不缩放战场']
+  ];
+  var i;
+  for (i = 0; i < 3; i++) {
+    text(rows[i][0], x + 28, y + 116 + i * 92, 16, C.text, 'left', 600);
+    text(rows[i][1], x + 28, y + 136 + i * 92, 12, C.text2, 'left', 400);
+    var bx = x + 28;
+    if (i === 0) {
+      strokeRect(bx, y + 148, 120, 38, UI.reducedMotion ? TH.ok : C.grid, 2);
+      fillRect(bx, y + 148, 120, 38, UI.reducedMotion ? rgba(TH.ok, 0.14) : rgba(C.bg, 0));
+      text(UI.reducedMotion ? '已开启' : '关闭', bx + 60, y + 173, 14, UI.reducedMotion ? TH.ok : C.text2, 'center', 600);
+    } else if (i === 1) {
+      var opts = [['off', '关'], ['deuter', '红绿'], ['trit', '蓝黄']];
+      for (var k = 0; k < 3; k++) {
+        var on = UI.colorblind === opts[k][0];
+        strokeRect(bx + k * 92, y + 148, 84, 38, on ? TH.accent : C.grid, 2);
+        if (on) fillRect(bx + k * 92, y + 148, 84, 38, rgba(TH.accent, 0.14));
+        text(opts[k][1], bx + k * 92 + 42, y + 173, 14, on ? TH.accent : C.text2, 'center', 600);
+      }
+    } else {
+      var scales = [1, 1.25, 1.5];
+      for (var k2 = 0; k2 < 3; k2++) {
+        var on2 = UI.uiScale === scales[k2];
+        strokeRect(bx + k2 * 92, y + 148, 84, 38, on2 ? TH.accent : C.grid, 2);
+        if (on2) fillRect(bx + k2 * 92, y + 148, 84, 38, rgba(TH.accent, 0.14));
+        text(Math.round(scales[k2] * 100) + '%', bx + k2 * 92 + 42, y + 173, 14, on2 ? TH.accent : C.text2, 'center', 600);
+      }
+    }
+  }
+  strokeRect(x + w - 148, y + h - 62, 120, 40, TH.accent, 2);
+  text('关闭', x + w - 88, y + h - 36, 15, TH.accent, 'center', 600);
+}
+function settingsClick(x, y) {
+  var bx = 388, by = 298;
+  if (x >= 1180 - 348 + 0 && false) return;
+  /* 关闭按钮 */
+  if (x >= 772 && x <= 892 && y >= 508 && y <= 548) { G.settingsOpen = false; sfx('click'); return; }
+  if (y >= 298 && y <= 336) {
+    if (x >= bx && x <= bx + 120) {
+      save.settings.reducedMotion = save.settings.reducedMotion ? 0 : 1;
+      applySettings(); writeSave(); bgDirty = true; sfx('click'); return;
+    }
+  }
+  if (y >= 390 && y <= 428) {
+    var ids = ['off', 'deuter', 'trit'];
+    for (var k = 0; k < 3; k++) {
+      if (x >= bx + k * 92 && x <= bx + k * 92 + 84) {
+        save.settings.colorblind = ids[k]; applySettings(); writeSave(); bgDirty = true; sfx('click'); return;
+      }
+    }
+  }
+  if (y >= 482 && y <= 520) {
+    var scales = [1, 1.25, 1.5];
+    for (var k2 = 0; k2 < 3; k2++) {
+      if (x >= bx + k2 * 92 && x <= bx + k2 * 92 + 84) {
+        save.settings.uiScale = scales[k2]; applySettings(); writeSave(); bgDirty = true; sfx('click'); return;
+      }
+    }
+  }
+  void by;
+}
+
+/* =============================================================== 34. 主循环 */
+var lastTs = 0, acc = 0;
+/* 世界时钟步进：只吃 worldDt（已乘 timeScale），固定步长 ≤50ms、最多 8 步/帧 */
+function simulate(ms) {
+  if (G.state !== 'PLAY' || G.phase === 'OVER') return;
+  G.battleMs += ms;
+  updateWardens(ms);
+  updateTowers(ms);
+  updateEnemies(ms);
+  updateShots(ms);
+  updateWave(ms);
+  pUpdate(ms);
+  G.bossFlashMs = Math.max(0, G.bossFlashMs - ms);
+}
+/* 三套时钟（art-bible §4.2 第 7/8 条）
+   ① worldDt = rawDt × timeScale → 敌人/塔/弹道/粒子/减速/DoT/Boss 脉冲环
+   ② rawDt（不缩放）           → 横幅/提示浮层/结算入场/按钮过渡/漏怪红罩/抖动
+   ③ gapMs += rawDt（仅 timeScale>0）→ 波间倒计时；暂停不计、倍速不缩放
+   暂停 = timeScale 0，不写独立 if(paused) 分支 */
+function updateReal(rawDt) {
+  var running = (G.state === 'PLAY' && G.phase !== 'OVER');
+  var scale = running ? (G.paused ? 0 : G.speed) : 0;
+  var worldDt = rawDt * scale;
+
+  if (worldDt > 0) {
+    var total = worldDt, guard = 0;
+    while (total > 0 && guard < 8) {
+      var step = Math.min(50, total);
+      simulate(step);
+      total -= step;
+      guard++;
+    }
+  }
+  /* ③ 波间倒计时：不乘 timeScale、暂停不累加（否则可暂停刷满奖励、倍速惩罚玩家） */
+  if (running && scale > 0 && G.phase === 'PREP') {
+    G.gapMs += rawDt;
+    if (G.gapMs >= GAP_MS) { G.gapMs = GAP_MS; startWave(); }
+  }
+  /* ② UI 时钟：恒定 */
+  if (G.hintMs > 0) G.hintMs -= rawDt;
+  if (G.banner.ms > 0) G.banner.ms -= rawDt;
+  if (shakeT > 0) shakeT -= rawDt;
+  if (G.flashMs > 0) G.flashMs -= rawDt;
+  if (G.state === 'PLAY') G.dominantArmor = dominantArmor();
+}
+function render(dt) {
+  if (G.state === 'MENU') drawMenu(dt);
+  else if (G.state === 'PLAY') drawPlay(dt);
+  else if (G.state === 'RESULT') drawResult();
+  else if (G.state === 'TECH') drawTech(dt);
+  if (G.settingsOpen) { setLogical(); drawSettings(); }
+}
+function loop(ts) {
+  if (!lastTs) lastTs = ts;
+  var dt = ts - lastTs;
+  lastTs = ts;
+  if (dt < 0) dt = 0;
+  if (dt > 80) dt = 80;
+  updateReal(dt);
+  render(dt);
+  window.requestAnimationFrame(loop);
+}
+
+/* ============================================================ 35. 调试接口 */
+window.__IV__ = {
+  get state() { return G; },
+  startMap: function (id) { startGame(id); return G.state; },
+  spawnEnemy: function (type, lane, startDist) {
+    if (!G.map) return null;
+    var e = spawnEnemy(type, lane || 0, { hp: 1800, startDist: startDist || 0 });
+    return e ? { eid: e.eid, hp: e.hp, x: e.x, y: e.y } : null;
+  },
+  setWave: function (n) {
+    G.wave = Math.max(0, Math.min(12, n | 0));
+    G.cleared = Math.max(0, G.wave - 1);
+    G.phase = 'PREP'; G.gapMs = 0;
+    G.queues = [];
+    return G.wave;
+  },
+  getTowers: function () {
+    return G.towers.map(function (t) {
+      return { id: t.def.id, lv: t.lv + 1, x: t.site.x, y: t.site.y, rng: towerRng(t), invested: t.invested, site: t.site.idx,
+        cdMs: Math.round(t.cdMs), lockMs: Math.round(t.lockMs), dmg: t.def.lv[t.lv].dmg,
+        pen: t.def.lv[t.lv].pen || 0, splash: t.def.lv[t.lv].splash || 0,
+        slow: t.def.lv[t.lv].slow || 0, dps: t.def.lv[t.lv].dps || 0 };
+    });
+  },
+  getEnemies: function () {
+    return G.enemies.map(function (e) {
+      return { eid: e.eid, type: e.type, hp: e.hp, maxHp: e.maxHp, arm: e.arm, flying: e.isFlying,
+        slow: Math.max(e.slowPct, e.mortarSlowPct), x: e.x, y: e.y, prog: e.prog, bounty: e.bountyZero ? 0 : e.bountyBase };
+    });
+  },
+  dmgCalc: dmgCalc,
+  save: function () { writeSave(); return JSON.parse(JSON.stringify(save)); },
+  load: function () { loadSave(); applySettings(); recomputeTech(); bgDirty = true; return JSON.parse(JSON.stringify(save)); },
+  reset: function () { resetSave(); applySettings(); recomputeTech(); bgDirty = true; return true; },
+  /* 额外辅助（QA 便利，非必需） */
+  addGold: function (n) { G.gold += n | 0; return G.gold; },
+  setGold: function (n) { G.gold = n | 0; return G.gold; },
+  damage: function (eid, amount, pen) {
+    for (var i = 0; i < G.enemies.length; i++) {
+      var e = G.enemies[i];
+      if (e.eid === eid && e.alive) { var d = applyDamage(e, amount, pen || 0, 'debug'); return { dealt: d, hp: e.hp, alive: e.alive }; }
+    }
+    return null;
+  },
+  tick: function (ms) { simulate(ms); return { phase: G.phase, wave: G.wave, enemies: G.enemies.length, gold: G.gold, hp: G.baseHP }; },
+  forceEndWave: function () { endWave(); return { wave: G.wave, gold: G.gold, hp: G.baseHP, phase: G.phase }; },
+  sell: function (siteIdx) {
+    if (!G.map || !G.map.sites[siteIdx] || !G.map.sites[siteIdx].tower) return null;
+    var g0 = G.gold;
+    sellTower(G.map.sites[siteIdx].tower);
+    return { refund: G.gold - g0 };
+  },
+  mod: function () { return JSON.parse(JSON.stringify(MOD)); },
+  ui: UI,
+  build: function (siteIdx, type, lv) {
+    if (!G.map || !G.map.sites[siteIdx]) return null;
+    var site = G.map.sites[siteIdx];
+    G.gold += 99999;
+    if (!buildAtSite(site, type)) return null;
+    var t = site.tower;
+    for (var i = 1; i < (lv || 1); i++) upgradeTower(t);
+    return { id: t.def.id, lv: t.lv + 1 };
+  },
+  towersData: TOWERS, enemiesData: ENEMIES, mapsData: MAPS, wavesData: WAVES, techData: TECH,
+  setSpeed: function (n) { G.speed = Math.max(1, Math.min(3, n | 0)); G.paused = false; return G.speed; },
+  pause: function (b) { G.paused = !!b; return G.paused; },
+  /* 波间倒计时（QA：验证「暂停不计、倍速不缩放」） */
+  setGap: function (ms) { G.gapMs = Math.max(0, Math.min(GAP_MS, ms || 0)); return G.gapMs; },
+  gapInfo: function () {
+    return { gapMs: Math.round(G.gapMs), remainSec: gapRemainSec(), bonus: gapRemainSec() * 2, phase: G.phase };
+  },
+  callNextWave: function () {
+    var g0 = G.gold;
+    callNextWave();
+    return { bonus: G.gold - g0, wave: G.wave, phase: G.phase };
+  },
+  blindZones: function () {
+    if (!G.map) return null;
+    return G.map.blind.map(function (b) {
+      var pm = G.map.lanes[b.lane], a = pathPoint(pm, b.s), z = pathPoint(pm, b.e);
+      return { lane: b.lane, from: { x: a.x, y: a.y }, to: { x: z.x, y: z.y }, len: Math.round(b.e - b.s) };
+    });
+  },
+  paths: function () {
+    if (!G.map) return null;
+    return G.map.lanes.map(function (l) { return { pts: l.pts, total: Math.round(l.total) }; });
+  }
+};
+
+/* QA 快照入口（便于自动化截图，不影响正常游玩）
+   例：index.html#play=M3&wave=6&towers=1   /   index.html#screen=tech        */
+function applyHashEntry() {
+  if (typeof window.location === 'undefined' || !window.location.hash) return;
+  var h = String(window.location.hash).replace(/^#/, '');
+  if (!h) return;
+  var q = {}, parts = h.split('&'), i, kv;
+  for (i = 0; i < parts.length; i++) {
+    kv = parts[i].split('=');
+    q[kv[0]] = kv[1] === undefined ? '1' : kv[1];
+  }
+  if (q.screen === 'tech') { G.state = 'TECH'; return; }
+  if (q.screen === 'menu') { G.state = 'MENU'; return; }
+  if (q.play && MAPS[q.play]) {
+    var keepGold = save.tp;
+    save.tp = Math.max(keepGold, 200);
+    startGame(q.play);
+    if (q.wave) {
+      var w = Math.max(1, Math.min(12, parseInt(q.wave, 10) || 1));
+      G.wave = w - 1; G.cleared = w - 1; G.phase = 'PREP'; G.gapMs = 0; G.queues = [];
+    }
+    if (q.towers) {
+      G.gold = 99999;
+      var types = ['A', 'B', 'C', 'D'];
+      for (i = 0; i < G.map.sites.length; i++) {
+        var site = G.map.sites[i];
+        var ty = site.high ? 'D' : types[i % 4];
+        if (buildAtSite(site, ty)) {
+          var tp2 = parseInt(q.lv || '2', 10);
+          for (var l = 1; l < tp2; l++) upgradeTower(site.tower);
+        }
+      }
+      G.gold = q.gold ? parseInt(q.gold, 10) : 850;
+    }
+    if (q.spawn) {
+      for (i = 0; i < 6; i++) spawnEnemy(i % 2 ? 'BULWARK' : 'GRUNT', 0, 200 + i * 90);
+      for (i = 0; i < 4; i++) spawnEnemy('WASP', 0);
+    }
+    if (q.sel) { G.selSite = G.map.sites[parseInt(q.sel, 10) || 0]; G.selTower = G.selSite.tower; }
+  }
+}
+
+/* ================================================================ 36. 启动 */
+function boot() {
+  loadSave();
+  applySettings();
+  recomputeTech();
+  resize();
+  buildHatch();
+  G.settingsOpen = false;
+  G.confirmReset = false;
+  G.mapId = 'M1';
+  G.state = 'MENU';
+  applyHashEntry();
+  var bootEl = document.getElementById('boot');
+  if (bootEl) bootEl.className = 'hide';
+  window.requestAnimationFrame(loop);
+}
+if (document.readyState === 'complete' || document.readyState === 'interactive') boot();
+else document.addEventListener('DOMContentLoaded', boot);
+
+})();
+</script>
+</body>
+</html>
